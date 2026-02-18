@@ -41,6 +41,55 @@ DEFAULT_CRITERIA = (
 
 _executor = ThreadPoolExecutor(max_workers=1)
 
+# ---------------------------------------------------------------------------
+# Settings persistence
+# ---------------------------------------------------------------------------
+
+SETTINGS_FILE = Path("settings.json")
+
+_DEFAULT_SETTINGS: dict = {
+    "group_url": "",
+    "email": "",
+    "save_session": True,
+    "max_posts": 100,
+    "top_n": 20,
+    "criteria_description": DEFAULT_CRITERIA,
+    "custom_keywords": "",
+    "gemini_api_key": "",
+    "headless": True,
+    "scroll_wait_ms": 1500,
+    "per_post_timeout": 5,
+    "enrich_total_timeout": 60,
+}
+
+
+def _load_settings() -> dict:
+    """Load settings from file, falling back to defaults for missing keys."""
+    if not SETTINGS_FILE.exists():
+        return dict(_DEFAULT_SETTINGS)
+    try:
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        merged = dict(_DEFAULT_SETTINGS)
+        merged.update({k: v for k, v in saved.items() if k in _DEFAULT_SETTINGS})
+        return merged
+    except Exception:
+        return dict(_DEFAULT_SETTINGS)
+
+
+def _save_settings(**kwargs) -> None:
+    """Persist one or more settings to file. Unknown keys are ignored."""
+    current = _load_settings()
+    for k, v in kwargs.items():
+        if k in _DEFAULT_SETTINGS:
+            current[k] = v
+    try:
+        SETTINGS_FILE.write_text(
+            json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -440,6 +489,9 @@ footer {
 # Gradio UI
 # ---------------------------------------------------------------------------
 
+# Load persisted settings once at UI build time
+_cfg = _load_settings()
+
 with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
 
     gr.HTML("""
@@ -462,6 +514,7 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                             label="URL grupy",
                             placeholder="https://www.facebook.com/groups/nazwa-grupy",
                             info="Wklej pełny link do grupy Facebook",
+                            value=_cfg["group_url"],
                             scale=4,
                         )
                     with gr.Row():
@@ -476,11 +529,11 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                     gr.HTML('<div class="section-title">📈 Parametry</div>')
                     max_posts = gr.Slider(
                         label="Maksymalna liczba postów do pobrania",
-                        minimum=20, maximum=500, value=100, step=10,
+                        minimum=20, maximum=500, value=_cfg["max_posts"], step=10,
                     )
                     top_n = gr.Slider(
                         label="Liczba wyników do wyświetlenia",
-                        minimum=5, maximum=50, value=20, step=1,
+                        minimum=5, maximum=50, value=_cfg["top_n"], step=1,
                     )
 
             gr.HTML('<div class="section-title">🔐 Dane logowania</div>')
@@ -488,6 +541,7 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                 email = gr.Textbox(
                     label="E-mail Facebook",
                     placeholder="twoj@email.com",
+                    value=_cfg["email"],
                     scale=2,
                 )
                 password = gr.Textbox(
@@ -499,7 +553,7 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                 with gr.Column(scale=1):
                     save_session = gr.Checkbox(
                         label="💾 Zapisz sesję",
-                        value=True,
+                        value=_cfg["save_session"],
                         info="Zapisuje ciasteczka, aby pominąć logowanie następnym razem",
                     )
                     session_status_md = gr.Markdown(value=_session_status())
@@ -510,7 +564,7 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                 with gr.Column():
                     criteria_description = gr.Textbox(
                         label="Opis kryteriów (używany przez Gemini)",
-                        value=DEFAULT_CRITERIA,
+                        value=_cfg["criteria_description"],
                         lines=2,
                     )
                     criteria_preset = gr.Dropdown(
@@ -524,6 +578,7 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                         label="Dodatkowe słowa kluczowe (oddzielone przecinkami)",
                         placeholder="np. dieta, trening, motywacja, schudnąć",
                         info="Posty zawierające te słowa będą zawsze uwzględnione",
+                        value=_cfg["custom_keywords"],
                     )
                     keywords_preset = gr.Dropdown(
                         label="📂 Poprzednie słowa kluczowe",
@@ -540,11 +595,12 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                     placeholder="AIza... (lub ustaw GEMINI_API_KEY w pliku .env)",
                     type="password",
                     info="Bezpłatny klucz: https://aistudio.google.com/app/apikey — wymagany do analizy semantycznej",
+                    value=_cfg["gemini_api_key"],
                     scale=4,
                 )
                 headless = gr.Checkbox(
                     label="Tryb bez okna (headless)",
-                    value=True,
+                    value=_cfg["headless"],
                     info="Ukrywa przeglądarkę. Wyłącz jeśli masz 2FA.",
                     scale=1,
                 )
@@ -553,17 +609,17 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
             with gr.Row():
                 scroll_wait_ms = gr.Slider(
                     label="Oczekiwanie po przewinięciu (ms)",
-                    minimum=500, maximum=5000, value=1500, step=250,
+                    minimum=500, maximum=5000, value=_cfg["scroll_wait_ms"], step=250,
                     info="Czas oczekiwania po każdym przewinięciu strony. Więcej = wolniej, ale pewniej.",
                 )
                 per_post_timeout = gr.Slider(
                     label="Limit czasu na post (s)",
-                    minimum=1, maximum=30, value=5, step=1,
+                    minimum=1, maximum=30, value=_cfg["per_post_timeout"], step=1,
                     info="Maks. czas wzbogacania jednego posta (reakcje, komentarze).",
                 )
                 enrich_total_timeout = gr.Slider(
                     label="Limit czasu wzbogacania łącznie (s)",
-                    minimum=10, maximum=300, value=60, step=10,
+                    minimum=10, maximum=300, value=_cfg["enrich_total_timeout"], step=10,
                     info="Maks. łączny czas fazy wzbogacania. Po przekroczeniu — reszta bez danych.",
                 )
 
@@ -626,6 +682,23 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
         inputs=keywords_preset,
         outputs=custom_keywords,
     )
+
+    # ── Auto-save settings on every change ──────────────────────────────
+    def _save(key):
+        return lambda v: _save_settings(**{key: v})
+
+    group_url.change(fn=_save("group_url"), inputs=group_url)
+    email.change(fn=_save("email"), inputs=email)
+    save_session.change(fn=_save("save_session"), inputs=save_session)
+    max_posts.change(fn=_save("max_posts"), inputs=max_posts)
+    top_n.change(fn=_save("top_n"), inputs=top_n)
+    criteria_description.change(fn=_save("criteria_description"), inputs=criteria_description)
+    custom_keywords.change(fn=_save("custom_keywords"), inputs=custom_keywords)
+    gemini_api_key.change(fn=_save("gemini_api_key"), inputs=gemini_api_key)
+    headless.change(fn=_save("headless"), inputs=headless)
+    scroll_wait_ms.change(fn=_save("scroll_wait_ms"), inputs=scroll_wait_ms)
+    per_post_timeout.change(fn=_save("per_post_timeout"), inputs=per_post_timeout)
+    enrich_total_timeout.change(fn=_save("enrich_total_timeout"), inputs=enrich_total_timeout)
 
     # Switch to results tab immediately, then run pipeline
     start_btn.click(

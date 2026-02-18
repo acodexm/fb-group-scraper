@@ -25,6 +25,7 @@ env/
 fb_scraper_results_*.csv
 groups_history.json
 presets.json
+settings.json
 
 # Playwright browser cache
 .playwright/
