@@ -92,7 +92,7 @@ def _build_user_prompt(posts_with_scores: list[dict], criteria: str) -> str:
     return "\n".join(lines)
 
 
-def _call_gemini_batch(posts: list[dict], criteria: str, api_key: str, log: Callable) -> list[dict | None]:
+def _call_gemini_batch(posts: list[dict], criteria: str, api_key: str, model: str, log: Callable) -> list[dict | None]:
     """
     Send a batch of posts to Gemini. Returns list of result dicts or None per post.
     """
@@ -105,7 +105,7 @@ def _call_gemini_batch(posts: list[dict], criteria: str, api_key: str, log: Call
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=_SYSTEM_PROMPT,
@@ -157,8 +157,11 @@ def analyze_posts(
         log("⚠️ No posts to analyze.")
         return pd.DataFrame()
 
-    # Step 1: Regex pre-filter — keep questions (syntactic) + custom keywords
-    log(f"🔍 Pre-filtering {len(posts)} posts for questions...")
+def filter_questions(posts: list[dict], custom_keywords: list[str], log: Callable = None) -> list[dict]:
+    """Filter posts to keep only questions or those matching custom keywords."""
+    if log:
+        log(f"🔍 Pre-filtering {len(posts)} posts for questions...")
+
     filtered = []
     for p in posts:
         text = p["text"]
@@ -167,19 +170,54 @@ def analyze_posts(
         if is_q or has_custom:
             filtered.append(p)
 
-    log(f"  → {len(filtered)} posts contain questions or match keywords.")
+    if log:
+        log(f"  → {len(filtered)} posts contain questions or match keywords.")
+    return filtered
 
-    # Deduplicate by normalized text (safety net for scraper-level duplicates)
-    seen_texts: set[str] = set()
+
+def deduplicate_posts(posts: list[dict], log: Callable = None) -> list[dict]:
+    """Deduplicate posts using MD5 hash of normalized text."""
+    seen_hashes: set[str] = set()
     deduped = []
-    for p in filtered:
-        norm = re.sub(r'\s+', ' ', p["text"]).lower()[:200]
-        if norm not in seen_texts:
-            seen_texts.add(norm)
+    for p in posts:
+        import hashlib
+        # Normalize whitespace and lowercase
+        norm = re.sub(r'\s+', ' ', p["text"]).lower()
+        h = hashlib.md5(norm.encode()).hexdigest()
+        if h not in seen_hashes:
+            seen_hashes.add(h)
             deduped.append(p)
-    if len(deduped) < len(filtered):
-        log(f"  → Removed {len(filtered) - len(deduped)} duplicate posts.")
-    filtered = deduped
+
+    if log and len(deduped) < len(posts):
+        log(f"  → Removed {len(posts) - len(deduped)} duplicate posts.")
+    return deduped
+
+
+def analyze_posts(
+    posts: list[dict],
+    custom_keywords: list[str],
+    top_n: int,
+    gemini_api_key: str,
+    criteria_description: str,
+    model: str,
+    log: Callable,
+) -> pd.DataFrame:
+    """
+    Main analysis pipeline.
+
+    Returns a DataFrame with columns:
+      rank, original_question, summary, category, reactions, comments, score
+    """
+    if not posts:
+        log("⚠️ No posts to analyze.")
+        return pd.DataFrame()
+
+    # Step 1: Regex pre-filter — keep questions (syntactic) + custom keywords
+    filtered = filter_questions(posts, custom_keywords, log)
+
+    # Deduplicate by full-text hash (safety net for scraper-level duplicates).
+    filtered = deduplicate_posts(filtered, log)
+
 
     if not filtered:
         log("⚠️ No questions found after pre-filtering. Try broader criteria or more posts.")
@@ -198,7 +236,7 @@ def analyze_posts(
     else:
         # No engagement data — send all filtered posts, let Gemini decide relevance
         candidate_pool = filtered[: top_n * 3]
-    log(f"  → Sending top {len(candidate_pool)} posts to Gemini for analysis...")
+    log(f"  → Sending top {len(candidate_pool)} posts to Gemini for analysis using {model}...")
 
     if not gemini_api_key:
         log("⚠️ No Gemini API key provided. Returning raw pre-filtered questions without AI analysis.")
@@ -225,7 +263,7 @@ def analyze_posts(
         total_batches = (len(candidate_pool) + BATCH_SIZE - 1) // BATCH_SIZE
         log(f"  🤖 Gemini batch {batch_num}/{total_batches} ({len(batch)} posts)...")
 
-        results = _call_gemini_batch(batch, criteria_description, gemini_api_key, log)
+        results = _call_gemini_batch(batch, criteria_description, gemini_api_key, model, log)
         all_results.extend(results)
 
     # Step 4: Merge results with posts, filter nulls, sort by score
