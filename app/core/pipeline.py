@@ -1,6 +1,7 @@
 import os
 import queue
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import gradio as gr
@@ -17,10 +18,17 @@ from app.persistence import (
 )
 
 _executor = ThreadPoolExecutor(max_workers=1)
+STOP_EVENT = threading.Event()
 
 
 def parse_custom_keywords(raw: str) -> list[str]:
     return [kw.strip() for kw in raw.split(",") if kw.strip()]
+
+
+def stop_scraper():
+    """Signal the scraper to stop."""
+    STOP_EVENT.set()
+    return "🛑 Sygnał zatrzymania wysłany..."
 
 
 def run_pipeline(
@@ -43,6 +51,8 @@ def run_pipeline(
     Gradio generator: yields (log_text, results_df, export_btn_update) tuples.
     The scraper runs in a background thread; we poll its log queue here.
     """
+    STOP_EVENT.clear()
+
     # --- Validate ---
     if not group_url.strip():
         yield "❌ Proszę podać URL grupy Facebook.", None, gr.update(visible=False)
@@ -73,6 +83,9 @@ def run_pipeline(
     result_holder: list[list[dict]] = [[]]  # mutable container for thread result
 
     def _run_scraper():
+        if STOP_EVENT.is_set():
+            return
+
         posts = scrape_group_threaded(
             group_url=group_url.strip(),
             email=email.strip(),
@@ -84,6 +97,7 @@ def run_pipeline(
             scroll_wait_ms=int(scroll_wait_ms),
             per_post_timeout=float(per_post_timeout),
             enrich_total_timeout=float(enrich_total_timeout),
+            stop_event=STOP_EVENT,
         )
         result_holder[0] = posts
 

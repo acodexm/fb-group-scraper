@@ -20,6 +20,7 @@ if __name__ == "__main__":
         run_pipeline_fn=pipeline.run_pipeline,
         clear_session_fn=pipeline.clear_session,
         session_status_fn=pipeline.session_status,
+        stop_scraper_fn=pipeline.stop_scraper,
     )
     
     demo.launch(

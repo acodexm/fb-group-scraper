@@ -12,7 +12,7 @@ from app.persistence import (
 )
 
 
-def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn):
+def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn, stop_scraper_fn):
     """
     Create and return the Gradio Blocks demo.
     Dependencies are injected to avoid circular imports.
@@ -158,11 +158,19 @@ def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn):
                         info="Maks. łączny czas fazy wzbogacania. Po przekroczeniu — reszta bez danych.",
                     )
 
-                start_btn = gr.Button(
-                    "🚀 Rozpocznij scrapowanie",
-                    variant="primary",
-                    size="lg",
-                )
+                with gr.Row():
+                    start_btn = gr.Button(
+                        "🚀 Rozpocznij scrapowanie",
+                        variant="primary",
+                        size="lg",
+                        scale=3,
+                    )
+                    stop_btn = gr.Button(
+                        "🛑 Zatrzymaj",
+                        variant="stop",
+                        size="lg",
+                        scale=1,
+                    )
 
             # ── Tab 2: Results ──────────────────────────────────────────────────
             with gr.Tab("📊 Wyniki", id="results"):
@@ -251,6 +259,8 @@ def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn):
             ],
             outputs=[log_output, results_table, export_btn],
         )
+
+        stop_btn.click(fn=stop_scraper_fn, outputs=log_output)
 
     return demo
 

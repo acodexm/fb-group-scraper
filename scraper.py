@@ -288,10 +288,16 @@ async def _scrape_async(
     scroll_wait_ms: int = 1500,
     per_post_timeout: float = 5.0,
     enrich_total_timeout: float = 60.0,
+    stop_event: "threading.Event | None" = None,
 ) -> list[dict]:
     posts: list[dict] = []
 
     async with async_playwright() as pw:
+        # Check stop before launch
+        if stop_event and stop_event.is_set():
+            log("🛑 Scraping stopped by user.")
+            return []
+        
         browser = await pw.chromium.launch(
             headless=headless,
             args=[
@@ -363,6 +369,9 @@ async def _scrape_async(
 
         # ── Phase 1: Fast scroll — collect text only ──────────────────────
         while len(collected) < max_posts:
+            if stop_event and stop_event.is_set():
+                log("🛑 Scraping stopped by user.")
+                break
             scroll_round += 1
 
             story_messages = await page.locator('[data-ad-rendering-role="story_message"]').all()
@@ -430,6 +439,10 @@ async def _scrape_async(
 
         timed_out_total = False
         for i, (text, story_el) in enumerate(collected):
+            if stop_event and stop_event.is_set():
+                log("🛑 Scraping stopped by user during enrichment.")
+                break
+
             # Check overall budget
             elapsed = asyncio.get_event_loop().time() - enrich_start
             if elapsed >= TOTAL_TIMEOUT:
@@ -485,6 +498,7 @@ def scrape_group_threaded(
     scroll_wait_ms: int = 1500,
     per_post_timeout: float = 5.0,
     enrich_total_timeout: float = 60.0,
+    stop_event: "threading.Event | None" = None,
 ) -> list[dict]:
     """
     Run the scraper in the current thread with its own event loop.
@@ -508,6 +522,7 @@ def scrape_group_threaded(
                 scroll_wait_ms=scroll_wait_ms,
                 per_post_timeout=per_post_timeout,
                 enrich_total_timeout=enrich_total_timeout,
+                stop_event=stop_event,
             )
         )
         return result
