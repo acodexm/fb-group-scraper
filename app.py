@@ -153,6 +153,9 @@ def run_pipeline(
     custom_keywords_raw: str,
     top_n: int,
     headless: bool,
+    scroll_wait_ms: int,
+    per_post_timeout: float,
+    enrich_total_timeout: float,
 ):
     """
     Gradio generator: yields (log_text, results_df, export_btn_update) tuples.
@@ -196,6 +199,9 @@ def run_pipeline(
             save_session=save_session,
             headless=headless,
             log_queue=log_q,
+            scroll_wait_ms=int(scroll_wait_ms),
+            per_post_timeout=float(per_post_timeout),
+            enrich_total_timeout=float(enrich_total_timeout),
         )
         result_holder[0] = posts
 
@@ -282,6 +288,9 @@ def run_pipeline(
 
     display_df = df[["rank", "original_question", "summary", "category", "reactions", "comments"]].copy()
     display_df.columns = ["#", "Oryginalne pytanie", "Podsumowanie (PL)", "Kategoria", "Reakcje", "Komentarze"]
+    # Sanitize newlines in text columns — multi-line cells break Gradio's table rendering
+    for col in ["Oryginalne pytanie", "Podsumowanie (PL)", "Kategoria"]:
+        display_df[col] = display_df[col].astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
 
     log_lines.append(f"\n🎉 Gotowe! Znaleziono {len(df)} pytań/problemów.")
     yield "\n".join(log_lines), display_df, gr.update(value=tmp.name, visible=True)
@@ -540,6 +549,24 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
                     scale=1,
                 )
 
+            gr.HTML('<div class="section-title">⏱️ Limity czasowe</div>')
+            with gr.Row():
+                scroll_wait_ms = gr.Slider(
+                    label="Oczekiwanie po przewinięciu (ms)",
+                    minimum=500, maximum=5000, value=1500, step=250,
+                    info="Czas oczekiwania po każdym przewinięciu strony. Więcej = wolniej, ale pewniej.",
+                )
+                per_post_timeout = gr.Slider(
+                    label="Limit czasu na post (s)",
+                    minimum=1, maximum=30, value=5, step=1,
+                    info="Maks. czas wzbogacania jednego posta (reakcje, komentarze).",
+                )
+                enrich_total_timeout = gr.Slider(
+                    label="Limit czasu wzbogacania łącznie (s)",
+                    minimum=10, maximum=300, value=60, step=10,
+                    info="Maks. łączny czas fazy wzbogacania. Po przekroczeniu — reszta bez danych.",
+                )
+
             start_btn = gr.Button(
                 "🚀 Rozpocznij scrapowanie",
                 variant="primary",
@@ -610,6 +637,7 @@ with gr.Blocks(title="📊 Facebook Group Scraper") as demo:
             group_url, email, password, max_posts, save_session,
             gemini_api_key, criteria_description,
             custom_keywords, top_n, headless,
+            scroll_wait_ms, per_post_timeout, enrich_total_timeout,
         ],
         outputs=[log_output, results_table, export_btn],
     )

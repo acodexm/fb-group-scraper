@@ -169,18 +169,35 @@ def analyze_posts(
 
     log(f"  → {len(filtered)} posts contain questions or match keywords.")
 
+    # Deduplicate by normalized text (safety net for scraper-level duplicates)
+    seen_texts: set[str] = set()
+    deduped = []
+    for p in filtered:
+        norm = re.sub(r'\s+', ' ', p["text"]).lower()[:200]
+        if norm not in seen_texts:
+            seen_texts.add(norm)
+            deduped.append(p)
+    if len(deduped) < len(filtered):
+        log(f"  → Removed {len(filtered) - len(deduped)} duplicate posts.")
+    filtered = deduped
+
     if not filtered:
         log("⚠️ No questions found after pre-filtering. Try broader criteria or more posts.")
         return pd.DataFrame()
 
-    # Step 2: Compute engagement score and sort
+    # Step 2: Compute engagement score
     for p in filtered:
         p["score"] = p.get("reactions", 0) + p.get("comments", 0) * 3
 
-    filtered.sort(key=lambda p: p["score"], reverse=True)
-
-    # Cap at top_n * 3 before sending to Gemini (avoid huge API calls)
-    candidate_pool = filtered[: top_n * 3]
+    # Cap candidate pool — if we have engagement data, prefer high-scoring posts;
+    # otherwise just take the first top_n * 3 (preserve feed order as a proxy for recency)
+    has_engagement = any(p["score"] > 0 for p in filtered)
+    if has_engagement:
+        filtered.sort(key=lambda p: p["score"], reverse=True)
+        candidate_pool = filtered[: top_n * 3]
+    else:
+        # No engagement data — send all filtered posts, let Gemini decide relevance
+        candidate_pool = filtered[: top_n * 3]
     log(f"  → Sending top {len(candidate_pool)} posts to Gemini for analysis...")
 
     if not gemini_api_key:

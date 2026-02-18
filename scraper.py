@@ -146,66 +146,123 @@ async def _extract_post_text(post_el) -> str:
     return ""
 
 
+async def _get_handle(el):
+    """Return an ElementHandle from either a Locator or an ElementHandle."""
+    # ElementHandle has .evaluate() directly; Locator has .element_handle()
+    if hasattr(el, 'element_handle'):
+        return await el.element_handle()
+    return el  # already an ElementHandle
+
+
 async def _extract_reactions(post_el) -> int:
-    """Extract total reaction count from the reaction summary bar."""
-    # Strategy 1: aria-label on the reaction summary span
-    for sel in [
-        'span[aria-label*="reaction"]',
-        'span[aria-label*="reakcj"]',
-        'span[aria-label*="Reaction"]',
-        'span[aria-label*="osób zareagowało"]',
-    ]:
-        try:
-            el = post_el.locator(sel).first
-            if await el.count() > 0:
-                label = await el.get_attribute("aria-label") or ""
-                nums = [
-                    int(s.replace(",", "").replace(".", "").replace("\xa0", ""))
-                    for s in label.split()
-                    if s.replace(",", "").replace(".", "").replace("\xa0", "").isdigit()
-                ]
-                if nums:
-                    return nums[0]
-        except Exception:
-            pass
-
-    # Strategy 2: the reaction count text node (e.g. "42" next to emoji icons)
+    """Extract total reaction count using JS evaluate on the element handle."""
     try:
-        # Look for a span that contains only a number near reaction emoji images
-        count_el = post_el.locator('span[aria-hidden="true"]').all()
-        for el in await count_el:
-            try:
-                text = (await el.inner_text()).strip().replace(",", "").replace(".", "").replace("\xa0", "")
-                if text.isdigit() and 1 <= int(text) <= 1_000_000:
-                    return int(text)
-            except Exception:
-                pass
+        handle = await _get_handle(post_el)
+        if not handle:
+            return 0
+        count = await handle.evaluate("""el => {
+            // Strategy 1: sum counts from individual reaction emoji buttons.
+            // FB renders each reaction type as a role=button inside a role=toolbar, with
+            // aria-label like: "Lubię to!: 12 osób" / "Like: 12 people" / "Trzymaj się: 1 osoba"
+            const toolbar = el.querySelector('[role="toolbar"]');
+            if (toolbar) {
+                const btns = toolbar.querySelectorAll('[role="button"]');
+                let total = 0;
+                for (const btn of btns) {
+                    const label = btn.getAttribute('aria-label') || '';
+                    // Match a number after ": " — covers both Polish and English labels
+                    const m = label.match(/:\\s*(\\d[\\d\\s,.]*)/);
+                    if (m) {
+                        const n = parseInt(m[1].replace(/[\\s,.]/g, ''), 10);
+                        if (!isNaN(n) && n > 0) total += n;
+                    }
+                }
+                if (total > 0) return total;
+            }
+            // Strategy 2: span with aria-label containing reaction keywords
+            // Facebook renders reaction summary as a span with aria-label like "42 people reacted"
+            const reactionSelectors = [
+                'span[aria-label*="reaction"]',
+                'span[aria-label*="Reaction"]',
+                'span[aria-label*="reakcj"]',
+                'span[aria-label*="osób zareagowało"]',
+                'span[aria-label*="people reacted"]',
+                'span[aria-label*="zareagowało"]',
+            ];
+            for (const sel of reactionSelectors) {
+                const el2 = el.querySelector(sel);
+                if (el2) {
+                    const label = el2.getAttribute('aria-label') || '';
+                    const m = label.match(/(\\d[\\d\\s]*)/);
+                    if (m) {
+                        const n = parseInt(m[1].replace(/\\s/g, ''), 10);
+                        if (!isNaN(n) && n > 0) return n;
+                    }
+                }
+            }
+            // Strategy 3: look for the reaction count number near the Like button area
+            // In the real DOM, the reaction bar has a div[data-ad-rendering-role="like_button"]
+            // and nearby there may be a span with just a number
+            const likeArea = el.querySelector('[data-ad-rendering-role="like_button"]');
+            if (likeArea) {
+                // Walk up to the action bar container and look for a number span
+                const bar = likeArea.closest('.x9f619');
+                if (bar) {
+                    const spans = bar.querySelectorAll('span');
+                    for (const s of spans) {
+                        const txt = (s.textContent || '').trim().replace(/[^0-9]/g, '');
+                        if (/^\\d+$/.test(txt)) {
+                            const n = parseInt(txt, 10);
+                            if (n >= 1 && n <= 999999) return n;
+                        }
+                    }
+                }
+            }
+            return 0;
+        }""")
+        return int(count) if count else 0
     except Exception:
-        pass
-
-    return 0
+        return 0
 
 
 async def _extract_comment_count(post_el) -> int:
-    """Extract comment count from the 'X comments' / 'X komentarzy' link."""
-    for sel in [
-        'span:has-text("komentarz")',
-        'span:has-text("komentarze")',
-        'span:has-text("komentarzy")',
-        'span:has-text("comment")',
-        'span:has-text("comments")',
-    ]:
-        try:
-            els = await post_el.locator(sel).all()
-            for el in els:
-                text = (await el.inner_text()).strip()
-                # Extract leading number: "42 komentarze" → 42
-                parts = text.split()
-                if parts and parts[0].replace(",", "").replace(".", "").isdigit():
-                    return int(parts[0].replace(",", "").replace(".", ""))
-        except Exception:
-            pass
-    return 0
+    """Extract comment count using JS evaluate on the element handle.
+
+    In the real Facebook DOM the comment count appears as a role=button element
+    containing a span with text like '11 komentarzy' or '3 comments'.
+    """
+    try:
+        handle = await _get_handle(post_el)
+        if not handle:
+            return 0
+        count = await handle.evaluate("""el => {
+            // Pattern: "11 komentarzy", "3 komentarze", "1 komentarz", "5 comments"
+            const pat = /^(\\d+)\\s*(komentarz|komentarze|komentarzy|comment|comments)$/i;
+
+            // Look in role=button elements first (that's where FB puts the comment count link)
+            const buttons = el.querySelectorAll('[role="button"] span, [role="link"] span');
+            for (const s of buttons) {
+                const txt = (s.textContent || '').trim();
+                const m = txt.match(pat);
+                if (m) return parseInt(m[1], 10);
+            }
+
+            // Fallback: scan all spans
+            const allSpans = el.querySelectorAll('span');
+            for (const s of allSpans) {
+                const txt = (s.textContent || '').trim();
+                const m = txt.match(pat);
+                if (m) return parseInt(m[1], 10);
+            }
+            return 0;
+        }""")
+        return int(count) if count else 0
+    except Exception:
+        return 0
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +277,9 @@ async def _scrape_async(
     save_session: bool,
     log: Callable,
     headless: bool,
+    scroll_wait_ms: int = 1500,
+    per_post_timeout: float = 5.0,
+    enrich_total_timeout: float = 60.0,
 ) -> list[dict]:
     posts: list[dict] = []
 
@@ -307,7 +367,10 @@ async def _scrape_async(
                     text = (await story_el.inner_text()).strip()
                     if not text or len(text) < 15:
                         continue
-                    key = text[:150]
+                    # Normalize key: collapse whitespace + lowercase to catch
+                    # truncated variants of the same post across scroll rounds
+                    import re as _re
+                    key = _re.sub(r'\s+', ' ', text).lower()[:200]
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
@@ -319,7 +382,7 @@ async def _scrape_async(
             log(f"  → Round {scroll_round}: {new_this_round} new posts | Total: {len(collected)}/{max_posts}")
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1500)  # shorter wait — just enough for lazy load
+            await page.wait_for_timeout(scroll_wait_ms)
             new_height = await page.evaluate("document.body.scrollHeight")
 
             if new_height <= last_height:
@@ -342,37 +405,74 @@ async def _scrape_async(
         # Get all article containers once (avoids repeated full-DOM queries)
         articles = await page.locator('div[role="article"]:has([data-ad-rendering-role="story_message"])').all()
 
-        for i, (text, story_el) in enumerate(collected):
+        # Timeouts (from UI settings)
+        PER_POST_TIMEOUT = per_post_timeout
+        TOTAL_TIMEOUT    = enrich_total_timeout
+        enrich_start = asyncio.get_event_loop().time()
+
+        async def _get_article_for_story(story_el):
+            """Walk up from story_el to find the enclosing article element."""
             try:
-                # Expand "See more" on this element
-                await _expand_see_more(story_el)
-                full_text = (await story_el.inner_text()).strip() or text
-
-                # Match to the corresponding article by index
-                article = articles[i] if i < len(articles) else story_el
-
-                reactions = await _extract_reactions(article)
-                comments = await _extract_comment_count(article)
-
-                posts.append({
-                    "text": full_text,
-                    "reactions": reactions,
-                    "comments": comments,
-                })
+                handle = await story_el.element_handle()
+                if not handle:
+                    return story_el
+                # Use JS to find the closest article ancestor
+                article_handle = await handle.evaluate_handle(
+                    "el => el.closest('div[role=\"article\"]') || el"
+                )
+                # Wrap back as a Playwright locator-like object via element_handle
+                return article_handle
             except Exception:
-                # Still include the post even if enrichment fails
+                return story_el
+
+        async def _enrich_one(text: str, story_el) -> dict:
+            """Enrich a single post — wrapped so we can apply a timeout."""
+            await _expand_see_more(story_el)
+            full_text = (await story_el.inner_text()).strip() or text
+            article = await _get_article_for_story(story_el)
+            reactions = await _extract_reactions(article)
+            comments  = await _extract_comment_count(article)
+            return {"text": full_text, "reactions": reactions, "comments": comments}
+
+        timed_out_total = False
+        for i, (text, story_el) in enumerate(collected):
+            # Check overall budget
+            elapsed = asyncio.get_event_loop().time() - enrich_start
+            if elapsed >= TOTAL_TIMEOUT:
+                log(f"  ⏱️ Enrichment time limit reached ({TOTAL_TIMEOUT:.0f}s). "
+                    f"Remaining {len(collected) - i} posts added without engagement data.")
+                # Add remaining posts without enrichment
+                for text2, _ in collected[i:]:
+                    posts.append({"text": text2, "reactions": 0, "comments": 0})
+                timed_out_total = True
+                break
+
+            try:
+                result = await asyncio.wait_for(
+                    _enrich_one(text, story_el),
+                    timeout=PER_POST_TIMEOUT,
+                )
+                posts.append(result)
+                # Debug: log first post's engagement to verify extraction works
+                if i == 0:
+                    log(f"  🔬 Post #1 engagement: reactions={result['reactions']}, comments={result['comments']}")
+            except asyncio.TimeoutError:
                 posts.append({"text": text, "reactions": 0, "comments": 0})
+            except Exception as e:
+                posts.append({"text": text, "reactions": 0, "comments": 0})
+
 
             # Progress log every 10 posts
             done = i + 1
             if done % 10 == 0 or done == len(collected):
-                log(f"  🔎 Enriched {done}/{len(collected)} posts...")
-
+                elapsed = asyncio.get_event_loop().time() - enrich_start
+                log(f"  🔎 Enriched {done}/{len(collected)} posts... ({elapsed:.0f}s elapsed)")
 
         await browser.close()
 
     log(f"✅ Scraping complete. Total posts collected: {len(posts)}")
     return posts
+
 
 
 
@@ -388,6 +488,9 @@ def scrape_group_threaded(
     save_session: bool,
     headless: bool,
     log_queue: "queue.Queue[str | None]",
+    scroll_wait_ms: int = 1500,
+    per_post_timeout: float = 5.0,
+    enrich_total_timeout: float = 60.0,
 ) -> list[dict]:
     """
     Run the scraper in the current thread with its own event loop.
@@ -408,6 +511,9 @@ def scrape_group_threaded(
                 save_session=save_session,
                 log=log,
                 headless=headless,
+                scroll_wait_ms=scroll_wait_ms,
+                per_post_timeout=per_post_timeout,
+                enrich_total_timeout=enrich_total_timeout,
             )
         )
         return result
