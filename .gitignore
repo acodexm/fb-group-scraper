@@ -19,7 +19,7 @@ env/
 *.env
 
 # Facebook session cookies (contain auth tokens)
-.fb_session.json
+.fb_session*.json
 
 # Scraped data & exports
 fb_scraper_results_*.csv

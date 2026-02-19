@@ -17,23 +17,23 @@ from typing import Callable
 
 from playwright.async_api import async_playwright, Page, BrowserContext
 
-COOKIES_FILE = Path(".fb_session.json")
+# COOKIES_FILE = Path(".fb_session.json")  # Moved to arg
 
 
 # ---------------------------------------------------------------------------
 # Cookie helpers
 # ---------------------------------------------------------------------------
 
-async def _save_cookies(context: BrowserContext) -> None:
+async def _save_cookies(context: BrowserContext, file_path: Path) -> None:
     cookies = await context.cookies()
-    COOKIES_FILE.write_text(json.dumps(cookies, indent=2))
+    file_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
 
 
-async def _load_cookies(context: BrowserContext) -> bool:
-    if not COOKIES_FILE.exists():
+async def _load_cookies(context: BrowserContext, file_path: Path) -> bool:
+    if not file_path.exists():
         return False
     try:
-        cookies = json.loads(COOKIES_FILE.read_text())
+        cookies = json.loads(file_path.read_text(encoding="utf-8"))
         await context.add_cookies(cookies)
         return True
     except Exception:
@@ -164,66 +164,79 @@ async def _extract_reactions(post_el) -> int:
         if not handle:
             return 0
         count = await handle.evaluate("""el => {
-            // Walk up to the article container — we receive the story_message element,
-            // but reactions/comments live in the article's action bar.
             const root = el.closest('div[role="article"]') || el;
-            // Strategy 1: sum counts from individual reaction emoji buttons.
-            // FB renders each reaction type as a role=button inside a role=toolbar, with
-            // aria-label like: "Lubię to!: 12 osób" / "Like: 12 people" / "Trzymaj się: 1 osoba"
+            
+            // Strategy 1: Look for the specific reaction count text (e.g. "123", "1.2K")
+            // usually next to the reaction icons.
+            // Selectors for the reaction/comment bar usually involve x9f619 and other obfuscated classes,
+            // so we look for the toolbar or specific aria-labels.
+            
+            // Try finding the toolbar first
             const toolbar = root.querySelector('[role="toolbar"]');
             if (toolbar) {
-                const btns = toolbar.querySelectorAll('[role="button"]');
-                let total = 0;
-                for (const btn of btns) {
-                    const label = btn.getAttribute('aria-label') || '';
-                    // Match a number after ": " — covers both Polish and English labels
-                    const m = label.match(/:\\s*(\\d[\\d\\s,.]*)/);
-                    if (m) {
-                        const n = parseInt(m[1].replace(/[\\s,.]/g, ''), 10);
-                        if (!isNaN(n) && n > 0) total += n;
-                    }
-                }
-                if (total > 0) return total;
+                 // The aggregate count is often in a div or span that is a sibling or child of the toolbar items
+                 // But most reliably, it is in an aria-label of the button that opens the reaction list
+                 const reactionBtn = toolbar.querySelector('[role="button"][aria-label*="ka"], [role="button"][aria-label*="ct"], [role="button"][aria-label*="osób"], [role="button"][aria-label*="people"]');
+                 if (reactionBtn) {
+                     const label = reactionBtn.getAttribute('aria-label');
+                     const m = label.match(/(\\d+[\\d\\s,.]*)/);
+                     if (m) {
+                         // Fix 1.2K -> 1200 if necessary, but usually raw number for small counts
+                         return parseInt(m[1].replace(/[\\s,.]/g, ''), 10);
+                     }
+                 }
             }
-            // Strategy 2: span with aria-label containing reaction keywords
-            // Facebook renders reaction summary as a span with aria-label like "42 people reacted"
-            const reactionSelectors = [
-                'span[aria-label*="reaction"]',
-                'span[aria-label*="Reaction"]',
-                'span[aria-label*="reakcj"]',
-                'span[aria-label*="osób zareagowało"]',
-                'span[aria-label*="people reacted"]',
-                'span[aria-label*="zareagowało"]',
-            ];
-            for (const sel of reactionSelectors) {
-                const el2 = root.querySelector(sel);
-                if (el2) {
-                    const label = el2.getAttribute('aria-label') || '';
-                    const m = label.match(/(\\d[\\d\\s]*)/);
-                    if (m) {
-                        const n = parseInt(m[1].replace(/\\s/g, ''), 10);
-                        if (!isNaN(n) && n > 0) return n;
-                    }
+
+            // Strategy 2: Broad search for numbers in the "status" checks top-left of action bar
+            // We look for the standard reaction icons container
+            const reactionIcons = root.querySelectorAll('span[role="img"][aria-label], img[role="presentation"]');
+            if (reactionIcons.length > 0) {
+                 // The count is usually in a span next to these icons
+                 // We find the container of icons and look for the text node/span next to it
+                 // This is fuzzy but often works when aria-labels fail
+                 const iconContainer = reactionIcons[0].closest('span')?.parentElement || reactionIcons[0].parentElement;
+                 if (iconContainer) {
+                     const txt = iconContainer.textContent.trim();
+                     // Look for a standalone number at the start or end
+                     const m = txt.match(/^(\\d+[\\d\\s,.]*[KkMm]?)/) || txt.match(/(\\d+[\\d\\s,.]*[KkMm]?)$/);
+                     if (m) {
+                         let valStr = m[1].replace(/,/g, '.').replace(/\\s/g, ''); # 1.2K
+                         let mult = 1;
+                         if (valStr.toLowerCase().includes('k')) { mult = 1000; valStr = valStr.replace(/[kK]/, ''); }
+                         else if (valStr.toLowerCase().includes('m')) { mult = 1000000; valStr = valStr.replace(/[mM]/, ''); }
+                         return Math.floor(parseFloat(valStr) * mult);
+                     }
+                 }
+            }
+            
+            // Strategy 3: Just find the text that looks like a reaction count (digit) not followed by "comments"
+            // This is risky but useful as fallback.
+            // We restrict to the bottom section of the article
+            const fullText = (root.innerText || root.textContent || '').trim();
+            // Look for a line that starts with a number and is likely the reactions count
+            // usually it appears before "comments" in the text dump
+            // e.g. "12\n3 comments"
+            const lines = fullText.split('\n').map(l => l.trim()).filter(l => l);
+            for (let i = lines.length - 1; i >= 0; i--) {
+                const line = lines[i];
+                // If line is just a number (possibly with K/M), and the NEXT line or nearby line is "Like" or "Comment"
+                // it is likely reactions.
+                // Or if it matches "X others" or "X people"
+                if (/^\\d+[\\d\\s,.]*[KkMm]?$/.test(line)) {
+                     // Check if it looks like a reaction count.
+                     // It should NOT be followed immediately by "comments" in the same line (handled by comment extractor)
+                     // If it's pure number, we assume reactions if we are in the footer area.
+                     // But date strings also look like numbers sometimes "2h".
+                     if (!line.match(/\\d+[hmwdys]$/)) { 
+                         let valStr = line.replace(/,/g, '.').replace(/\\s/g, '');
+                         let mult = 1;
+                         if (valStr.toLowerCase().includes('k')) { mult = 1000; valStr = valStr.replace(/[kK]/, ''); }
+                         else if (valStr.toLowerCase().includes('m')) { mult = 1000000; valStr = valStr.replace(/[mM]/, ''); }
+                         return Math.floor(parseFloat(valStr) * mult);
+                     }
                 }
             }
-            // Strategy 3: look for the reaction count number near the Like button area
-            // In the real DOM, the reaction bar has a div[data-ad-rendering-role="like_button"]
-            // and nearby there may be a span with just a number
-            const likeArea = root.querySelector('[data-ad-rendering-role="like_button"]');
-            if (likeArea) {
-                // Walk up to the action bar container and look for a number span
-                const bar = likeArea.closest('.x9f619');
-                if (bar) {
-                    const spans = bar.querySelectorAll('span');
-                    for (const s of spans) {
-                        const txt = (s.textContent || '').trim().replace(/[^0-9]/g, '');
-                        if (/^\\d+$/.test(txt)) {
-                            const n = parseInt(txt, 10);
-                            if (n >= 1 && n <= 999999) return n;
-                        }
-                    }
-                }
-            }
+
             return 0;
         }""")
         return int(count) if count else 0
@@ -232,45 +245,42 @@ async def _extract_reactions(post_el) -> int:
 
 
 async def _extract_comment_count(post_el) -> int:
-    """Extract comment count using JS evaluate on the element handle.
-
-    In the real Facebook DOM the comment count appears as a role=button element
-    containing a span with text like '11 komentarzy' or '3 comments'.
-    """
+    """Extract comment count using JS evaluate on the element handle."""
     try:
         handle = await _get_handle(post_el)
         if not handle:
             return 0
         count = await handle.evaluate("""el => {
-            // Walk up to the article container
             const root = el.closest('div[role="article"]') || el;
-            // Pattern: "11 komentarzy", "3 komentarze", "1 komentarz", "5 comments"
-            const pat = /^(\\d+)\\s*(komentarz|komentarze|komentarzy|comment|comments)$/i;
-
-            // Look in role=button elements first (that's where FB puts the comment count link)
-            const buttons = root.querySelectorAll('[role="button"] span, [role="link"] span');
-            for (const s of buttons) {
-                const txt = (s.textContent || '').trim();
-                const m = txt.match(pat);
-                if (m) return parseInt(m[1], 10);
+            
+            // Regex for "2 comments", "16 komentarzy", "1 komentarz"
+            const commentRegex = /(\\d+[\\d\\s,.]*[KkMm]?)\\s*(komentarz|comment)/i;
+            
+            // 1. Check all elements with role="button" or "link" as they are clickable
+            const clickables = root.querySelectorAll('[role="button"], [role="link"]');
+            for (const el of clickables) {
+                const txt = el.textContent.trim();
+                const m = txt.match(commentRegex);
+                if (m) {
+                     let valStr = m[1].replace(/,/g, '.').replace(/\\s/g, '');
+                     let mult = 1;
+                     if (valStr.toLowerCase().includes('k')) { mult = 1000; valStr = valStr.replace(/[kK]/, ''); }
+                     else if (valStr.toLowerCase().includes('m')) { mult = 1000000; valStr = valStr.replace(/[mM]/, ''); }
+                     return Math.floor(parseFloat(valStr) * mult);
+                }
             }
-
-            // Fallback: scan all spans
-            const allSpans = root.querySelectorAll('span');
-            for (const s of allSpans) {
-                const txt = (s.textContent || '').trim();
-                const m = txt.match(pat);
-                if (m) return parseInt(m[1], 10);
+            
+            // 2. Fallback: Check text content of possible status info areas
+                         return Math.floor(parseFloat(valStr) * mult);
+                     }
+                 }
             }
+            
             return 0;
         }""")
         return int(count) if count else 0
     except Exception:
         return 0
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -285,18 +295,20 @@ async def _scrape_async(
     save_session: bool,
     log: Callable,
     headless: bool,
+    session_file_path: Path,
     scroll_wait_ms: int = 1500,
     per_post_timeout: float = 5.0,
     enrich_total_timeout: float = 60.0,
     stop_event: "threading.Event | None" = None,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     posts: list[dict] = []
+    group_name = ""
 
     async with async_playwright() as pw:
         # Check stop before launch
         if stop_event and stop_event.is_set():
             log("🛑 Scraping stopped by user.")
-            return []
+            return [], ""
         
         browser = await pw.chromium.launch(
             headless=headless,
@@ -306,42 +318,95 @@ async def _scrape_async(
             ],
         )
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             locale="pl-PL",
         )
+
+        # Load session if exists
+        if save_session and session_file_path.exists():
+            try:
+                cookies = json.loads(session_file_path.read_text(encoding="utf-8"))
+                await context.add_cookies(cookies)
+                log("🍪 Loaded saved session, checking if still valid...")
+            except Exception:
+                log("⚠️ Failed to load cookies, starting fresh.")
+
         page = await context.new_page()
 
-        # Session
-        logged_in = False
-        if save_session and await _load_cookies(context):
-            log("🍪 Loaded saved session, checking if still valid...")
-            logged_in = await _is_logged_in(page)
-            if logged_in:
-                log("✅ Session still valid — skipping login!")
-            else:
-                log("⚠️ Saved session expired, logging in fresh...")
+        # Check login status
+        is_logged_in = False
+        try:
+            # Navigate to a known Facebook page to check login status
+            await page.goto("https://www.facebook.com/", timeout=60000)
+            # Look for something that indicates logged in state, e.g. account menu
+            await page.wait_for_selector('div[role="navigation"]', timeout=5000)
+            is_logged_in = True
+            log("✅ Session still valid — skipping login!")
+        except Exception:
+            pass
 
-        if not logged_in:
+        if not is_logged_in:
+            if not email or not password:
+                log("❌ Not logged in and no credentials provided. Exiting.")
+                await browser.close()
+                return [], ""
+            
+            log("🔑 Logging in...")
             logged_in = await _do_login(page, email, password, log)
             if not logged_in:
                 await browser.close()
-                return []
-            if save_session:
-                await _save_cookies(context)
-                log("💾 Session saved for next time.")
+                return [], ""
+
+        if save_session:
+            cookies = await context.cookies()
+            session_file_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+            log("💾 Session saved for next time.")
 
         # Navigate to group
         log(f"🌐 Navigating to group: {group_url}")
         try:
-            await page.goto(group_url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(group_url, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
             log(f"⚠️ Navigation warning (continuing): {e}")
         await page.wait_for_timeout(4000)
+
+        # Attempt to extract group name
+        try:
+             # Strategy 1: OG title
+             og_title = await page.locator('meta[property="og:title"]').get_attribute("content")
+             if og_title:
+                 group_name = og_title.strip()
+             
+             if not group_name or "facebook" in group_name.lower():
+                 # Strategy 2: h1
+                 h1_text = await page.locator("h1").first.text_content()
+                 if h1_text:
+                     group_name = h1_text.strip()
+
+             if not group_name or "facebook" in group_name.lower():
+                 # Strategy 3: Look for a link to the group itself in the banner
+                 # Many groups have the name in an anchor tag pointing to the group URL
+                 # We look for an anchor whose href ends with the group ID/slug
+                 # or contains the group ID/slug
+                 try:
+                     group_id_slug = group_url.rstrip("/").split("/")[-1]
+                     # Find anchor with href containing this slug, but exclude post permalinks
+                     # Usually the group name is in a large font or specific location
+                     potential_name = await page.locator(f'a[href*="{group_id_slug}"][role="link"]').first.text_content()
+                     if potential_name:
+                         group_name = potential_name.strip()
+                 except Exception:
+                     pass
+
+        except Exception:
+            pass
+        
+        if group_name:
+             # Clean up " | Facebook" if present
+             group_name = group_name.replace(" | Facebook", "").replace("Facebook", "").strip()
+        log(f"ℹ️ Group name: {group_name if group_name else 'Unknown'}")
+
 
         # Dismiss popups
         for selector in [
@@ -478,7 +543,7 @@ async def _scrape_async(
         await browser.close()
 
     log(f"✅ Scraping complete. Total posts collected: {len(posts)}")
-    return posts
+    return posts, group_name
 
 
 
@@ -494,12 +559,13 @@ def scrape_group_threaded(
     max_posts: int,
     save_session: bool,
     headless: bool,
+    session_file_path: Path,
     log_queue: "queue.Queue[str | None]",
     scroll_wait_ms: int = 1500,
     per_post_timeout: float = 5.0,
     enrich_total_timeout: float = 60.0,
     stop_event: "threading.Event | None" = None,
-) -> list[dict]:
+) -> tuple[list[dict], str]:  # Returns (posts, group_name)
     """
     Run the scraper in the current thread with its own event loop.
     Log messages are put into log_queue. Sends None sentinel when done.
@@ -510,22 +576,27 @@ def scrape_group_threaded(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(
-            _scrape_async(
-                group_url=group_url,
-                email=email,
-                password=password,
-                max_posts=max_posts,
-                save_session=save_session,
-                log=log,
-                headless=headless,
-                scroll_wait_ms=scroll_wait_ms,
-                per_post_timeout=per_post_timeout,
-                enrich_total_timeout=enrich_total_timeout,
-                stop_event=stop_event,
+        try:
+            result = loop.run_until_complete(
+                _scrape_async(
+                    group_url=group_url,
+                    email=email,
+                    password=password,
+                    max_posts=max_posts,
+                    save_session=save_session,
+                    log=log,
+                    headless=headless,
+                    session_file_path=session_file_path,
+                    scroll_wait_ms=scroll_wait_ms,
+                    per_post_timeout=per_post_timeout,
+                    enrich_total_timeout=enrich_total_timeout,
+                    stop_event=stop_event,
+                )
             )
-        )
-        return result
+            return result
+        except Exception as e:
+            log(f"❌ Critical error in scraper thread: {e}")
+            return [], ""
     finally:
         loop.close()
         log_queue.put(None)  # sentinel

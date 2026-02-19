@@ -8,7 +8,6 @@ from app.persistence import (
     save_to_history,
     save_preset,
     DEFAULT_CRITERIA,
-    COOKIES_FILE,
 )
 
 
@@ -83,7 +82,8 @@ def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn, stop_scrap
                             value=_cfg["save_session"],
                             info="Zapisuje ciasteczka, aby pominąć logowanie następnym razem",
                         )
-                        session_status_md = gr.Markdown(value=session_status_fn())
+                        # Initialize status with loaded email
+                        session_status_md = gr.Markdown(value=session_status_fn(_cfg["email"]))
                         clear_session_btn = gr.Button("🗑️ Usuń sesję", size="sm", variant="secondary")
 
                 gr.HTML('<div class="section-title">🔍 Kryteria wyszukiwania</div>')
@@ -175,6 +175,10 @@ def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn, stop_scrap
             # ── Tab 2: Results ──────────────────────────────────────────────────
             with gr.Tab("📊 Wyniki", id="results"):
 
+                with gr.Row():
+                    start_btn_res = gr.Button("🚀 Start", variant="primary", scale=2)
+                    stop_btn_res = gr.Button("🛑 Stop", variant="stop", scale=1)
+
                 log_output = gr.Textbox(
                     label="📋 Log postępu",
                     lines=12,
@@ -205,7 +209,11 @@ def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn, stop_scrap
 
         # ── Events ───────────────────────────────────────────────────────────────
 
-        clear_session_btn.click(fn=clear_session_fn, outputs=session_status_md)
+        # Pass email to clear_session_fn
+        clear_session_btn.click(fn=clear_session_fn, inputs=email, outputs=session_status_md)
+        
+        # Update status when email changes
+        email.change(fn=session_status_fn, inputs=email, outputs=session_status_md)
 
         # Load URL from history dropdown
         history_dropdown.change(
@@ -260,7 +268,20 @@ def create_demo(run_pipeline_fn, clear_session_fn, session_status_fn, stop_scrap
             outputs=[log_output, results_table, export_btn],
         )
 
+        start_btn_res.click(
+            fn=run_pipeline_fn,
+            inputs=[
+                group_url, email, password, max_posts, save_session,
+                gemini_api_key, criteria_description,
+                custom_keywords, top_n, headless,
+                scroll_wait_ms, per_post_timeout, enrich_total_timeout,
+                model,
+            ],
+            outputs=[log_output, results_table, export_btn],
+        )
+
         stop_btn.click(fn=stop_scraper_fn, outputs=log_output)
+        stop_btn_res.click(fn=stop_scraper_fn, outputs=log_output)
 
     return demo
 

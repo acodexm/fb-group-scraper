@@ -8,13 +8,14 @@ import gradio as gr
 import pandas as pd
 
 from analyzer import analyze_posts
-from scraper import scrape_group_threaded, COOKIES_FILE
+from scraper import scrape_group_threaded
 from app.persistence import (
     save_to_history,
     save_preset,
     DEFAULT_CRITERIA,
     load_history,
     load_presets,
+    get_session_file_path,
 )
 
 _executor = ThreadPoolExecutor(max_workers=1)
@@ -57,11 +58,15 @@ def run_pipeline(
     if not group_url.strip():
         yield "❌ Proszę podać URL grupy Facebook.", None, gr.update(visible=False)
         return
-    if not email.strip() and not COOKIES_FILE.exists():
-        yield "❌ Proszę podać adres e-mail.", None, gr.update(visible=False)
+
+    input_email = email.strip()
+    session_file_path = get_session_file_path(input_email)
+
+    if not input_email and not session_file_path.exists():
+        yield "❌ Proszę podać adres e-mail (lub upewnij się, że masz zapisaną sesję dla pustego emaila).", None, gr.update(visible=False)
         return
-    if not password.strip() and not COOKIES_FILE.exists():
-        yield "❌ Proszę podać hasło.", None, gr.update(visible=False)
+    if not password.strip() and not session_file_path.exists():
+        yield "❌ Proszę podać hasło (lub upewnij się, że masz zapisaną sesję).", None, gr.update(visible=False)
         return
 
     # Save group to history before scraping
@@ -86,13 +91,14 @@ def run_pipeline(
         if STOP_EVENT.is_set():
             return
 
-        posts = scrape_group_threaded(
+        posts, group_name = scrape_group_threaded(
             group_url=group_url.strip(),
-            email=email.strip(),
+            email=input_email,
             password=password.strip(),
             max_posts=int(max_posts),
             save_session=save_session,
             headless=headless,
+            session_file_path=session_file_path,
             log_queue=log_q,
             scroll_wait_ms=int(scroll_wait_ms),
             per_post_timeout=float(per_post_timeout),
@@ -100,6 +106,8 @@ def run_pipeline(
             stop_event=STOP_EVENT,
         )
         result_holder[0] = posts
+        if group_name:
+            save_to_history(group_url.strip(), group_name)
 
     # --- Launch scraper in background thread ---
     log_lines.append("🚀 Rozpoczynam scrapowanie...")
@@ -193,14 +201,24 @@ def run_pipeline(
     yield "\n".join(log_lines), display_df, gr.update(value=tmp.name, visible=True)
 
 
-def clear_session():
-    if COOKIES_FILE.exists():
-        COOKIES_FILE.unlink()
-        return "🗑️ Sesja usunięta."
+def clear_session(email: str) -> str:
+    """Remove the session file for the given email."""
+    path = get_session_file_path(email)
+    if path.exists():
+        try:
+            path.unlink()
+            return "🗑️ Sesja usunięta."
+        except Exception as e:
+            return f"⚠️ Błąd usuwania: {e}"
     return "ℹ️ Brak zapisanej sesji."
 
 
-def session_status() -> str:
-    if COOKIES_FILE.exists():
+def session_status(email: str = "") -> str:
+    """Check if a session file exists for the given email."""
+    # If called without email (e.g. init), we might want to check env/settings?
+    # But usually it's called with the input value. 
+    # If email is empty, get_session_file_path returns the default/legacy path.
+    path = get_session_file_path(email)
+    if path.exists():
         return "✅ Zapisana sesja istnieje"
     return "ℹ️ Brak zapisanej sesji"
