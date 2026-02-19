@@ -42,6 +42,9 @@ pip install -r requirements.txt
 
 # 6. Zainstaluj silnik przeglądarki
 playwright install chromium
+
+# 7. (Opcjonalnie) Nadaj uprawnienia do uruchamiania skryptu jednym kliknięciem
+chmod +x start_app.command
 ```
 
 ### 3. Konfiguracja Klucza AI (Opcjonalne)
@@ -60,7 +63,19 @@ Aby raporty były inteligentnie podsumowywane przez Gemini:
 
 ## ▶️ Jak uruchamiać (na co dzień)
 
-Za każdym razem, gdy chcesz użyć programu:
+Masz teraz dwie opcje:
+
+### Opcja A: Kliknij i uruchom (Zalecane)
+1. Wejdź do folderu `facebook-scraper` w Finderze.
+2. Kliknij dwukrotnie plik **`start_app.command`**.
+   - *Za pierwszym razem:* Jeśli zobaczysz komunikat, że "nie można otworzyć aplikacji, bo pochodzi od niezidentyfikowanego dewelopera", kliknij w plik **Prawym Przyciskiem Mysz** -> wybierz **Otwórz** -> i potwierdź przyciskiem **Otwórz**.
+3. Terminal otworzy się, a aplikacja powinna wystartować automatycznie w przeglądarce.
+
+---
+
+### Opcja B: Przez Terminal (Dla zaawansowanych)
+
+Za każdym razem, gdy chcesz użyć programu ręcznie:
 
 1. Otwórz Terminal.
 2. Wpisz komendy:
@@ -113,6 +128,7 @@ facebook-scraper/
 ├── app.py          # Interfejs Gradio (uruchom ten plik)
 ├── scraper.py      # Logika scrapowania (Playwright)
 ├── analyzer.py     # Analiza NLP (wykrywanie pytań, grupowanie)
+├── start_app.command # Skrypt uruchamiający aplikację jednym kliknięciem
 ├── requirements.txt
 ├── .env.example    # Szablon pliku z kluczem API
 └── README.md
