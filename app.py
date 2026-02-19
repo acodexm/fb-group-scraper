@@ -29,6 +29,7 @@ if __name__ == "__main__":
         share=False,
         inbrowser=True,
         css=layout.CUSTOM_CSS,
+        js=layout.CUSTOM_JS,
         theme=gr.themes.Soft(
             primary_hue="blue",
             secondary_hue="slate",

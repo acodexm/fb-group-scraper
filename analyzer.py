@@ -1,306 +1,180 @@
 """
-analyzer.py — Polish NLP pipeline for question detection and Gemini analysis.
+analyzer.py — Polish NLP pipeline for data cleaning and Gemini summarization.
 
 Pipeline:
-  1. Regex pre-filter: keep posts containing ? or interrogative words (PL + EN)
-  2. Rank by engagement: score = reactions + (comments × 3)
-  3. Gemini batch analysis: returns original_question, summary (PL), category (PL)
-  4. Final sort by score, return top N
+  1. Clean text (remove HTML, emojis, newlines).
+  2. Deduplicate.
+  3. Send formatted JSON to Gemini to generate a Markdown summary/ranking.
 """
 
 import json
 import re
 from typing import Callable
-
 import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Regex pre-filter patterns (PL + EN interrogatives)
+# Text Cleaning
 # ---------------------------------------------------------------------------
 
-# Polish interrogative words
-_PL_INTERROGATIVES = [
-    r"\bczy\b", r"\bjak\b", r"\bco\b", r"\bgdzie\b", r"\bkiedy\b",
-    r"\bdlaczego\b", r"\bczemu\b", r"\bkto\b", r"\bkogo\b", r"\bkomu\b",
-    r"\bile\b", r"\bktóry\b", r"\bktóra\b", r"\bktóre\b", r"\bpo co\b",
-    r"\bw jaki sposób\b", r"\bskąd\b", r"\bna co\b", r"\bz czym\b",
-    r"\bjakie\b", r"\bjaki\b", r"\bjaka\b", r"\bczym\b",
-]
-
-# English interrogative words
-_EN_INTERROGATIVES = [
-    r"\bhow\b", r"\bwhat\b", r"\bwhere\b", r"\bwhen\b", r"\bwhy\b",
-    r"\bwho\b", r"\bwhich\b", r"\bis there\b", r"\bare there\b",
-    r"\bdoes\b", r"\bdo\b", r"\bcan\b", r"\bcould\b", r"\bshould\b",
-    r"\banyone\b", r"\bhas anyone\b", r"\bhave you\b",
-]
-
-_ALL_INTERROGATIVES = _PL_INTERROGATIVES + _EN_INTERROGATIVES
-
-
-def _is_question(text: str) -> bool:
-    """Return True if the post looks like a question (syntactic check only)."""
-    if "?" in text:
-        return True
-    text_lower = text.lower()
-    return any(re.search(p, text_lower) for p in _ALL_INTERROGATIVES)
-
+def clean_text(text: str) -> str:
+    """Remove HTML, newlines, extra whitespace, and emojis."""
+    if not text:
+        return ""
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Remove URLs (optional, but usually good for "pure text")
+    # text = re.sub(r'http\S+', '', text) 
+    # Replace newlines with space
+    text = re.sub(r'[\r\n]+', ' ', text)
+    # Normalize duplicate whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove emojis (basic range check)
+    # This regex covers many common emoji ranges but not all. 
+    # For a robust solution, 'emoji' library is better, but avoiding new deps if possible.
+    # Using a simple block range for now.
+    try:
+        # High surrogate pass for some emojis
+        text = text.encode('ascii', 'ignore').decode('ascii')
+    except:
+        pass
+    
+    return text.strip()
 
 # ---------------------------------------------------------------------------
-# Gemini batch analysis
+# Gemini summarization
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """Jesteś analitykiem grup społecznościowych na Facebooku.
-Otrzymasz listę postów z grupy. Twoje zadanie:
-1. Przeanalizuj każdy post pod kątem podanych kryteriów wyszukiwania.
-2. Dla każdego posta który pasuje do kryteriów, zwróć obiekt JSON.
-3. Dla postów które NIE pasują do kryteriów, zwróć null.
+_SYSTEM_PROMPT = """Jesteś ekspertem i analitykiem danych z mediów społecznościowych.
+Twoim zadaniem jest przeanalizowanie dostarczonych postów i komentarzy (w formacie JSON) i przygotowanie raportu.
 
-Zasady:
-- Odpowiadaj ZAWSZE po polsku (nawet jeśli post jest po angielsku).
-- "summary" to jedno zdanie (max 150 znaków) opisujące problem/pytanie użytkownika.
-- "category" to krótka etykieta (2-4 słowa) np. "Dieta i odżywianie", "Motywacja", "Sprzęt sportowy".
-- "original_question" to oryginalne pytanie/post (przepisz dosłownie, bez skracania).
-- Zwróć TYLKO tablicę JSON, bez żadnego dodatkowego tekstu ani markdown.
+INSTRUKCJE UŻYTKOWNIKA:
+{user_instructions}
+
+FORMAT ODPOWIEDZI:
+Wygeneruj czytelny raport w formacie MARKDOWN.
+Raport powinien zawierać:
+1. Podsumowanie ogólne (synteza najważniejszych wątków).
+2. Ranking / Lista punktowa (zgodnie z instrukcjami użytkownika).
+3. Wnioski.
+
+Nie używaj tagów XML, nie zwracaj JSON. Zwróć czysty tekst Markdown.
+Piszesz po polsku.
 """
 
-
-def _build_user_prompt(posts_with_scores: list[dict], criteria: str) -> str:
+def _build_summary_prompt(posts: list[dict], user_instructions: str) -> str:
     lines = [
-        f"Kryteria wyszukiwania: {criteria}",
-        "",
-        "Posty do analizy (format: [indeks] [wynik_zaangażowania] tekst):",
-        "",
+        "Oto dane z grupy Facebook (posty i komentarze):",
+        "```json"
     ]
-    for i, p in enumerate(posts_with_scores):
-        score = p["reactions"] + p["comments"] * 3
-        # Truncate very long posts to ~800 chars to save tokens
-        text = p["text"]
-        if len(text) > 800:
-            text = text[:797] + "..."
-        lines.append(f"[{i}] [score:{score}] {text}")
-        lines.append("")
-
-    lines.append(
-        f"Zwróć tablicę JSON z {len(posts_with_scores)} elementami "
-        f"(null dla postów nie pasujących do kryteriów). Przykład:\n"
-        f'[{{"original_question": "...", "summary": "...", "category": "..."}}, null, ...]'
-    )
+    # Minimize JSON to save tokens
+    clean_posts = []
+    for p in posts:
+        clean_posts.append({
+            "text": clean_text(p.get("text", "")),
+            "reactions": p.get("reactions", 0),
+            "comments": p.get("comments", 0)
+        })
+    
+    lines.append(json.dumps(clean_posts, ensure_ascii=False))
+    lines.append("```")
+    lines.append(f"\nInstrukcje dodatkowe: {user_instructions}")
+    
     return "\n".join(lines)
 
 
-def _call_gemini_batch(posts: list[dict], criteria: str, api_key: str, model: str, log: Callable) -> list[dict | None]:
+def _call_gemini_summary(posts: list[dict], user_instructions: str, api_key: str, model: str, log: Callable) -> str:
     """
-    Send a batch of posts to Gemini. Returns list of result dicts or None per post.
+    Send all posts to Gemini to generate one big summary.
     """
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
+    prompt = _build_summary_prompt(posts, user_instructions)
+    log(f"  📤 Sending {len(posts)} posts to Gemini (approx {len(prompt)//4} tokens)...")
 
-    prompt = _build_user_prompt(posts, criteria)
+    formatted_system_prompt = _SYSTEM_PROMPT.format(user_instructions=user_instructions)
 
     try:
         response = client.models.generate_content(
             model=model,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-                temperature=0.2,
-                response_mime_type="application/json",
+                system_instruction=formatted_system_prompt,
+                temperature=0.3,
             ),
         )
-        raw = response.text.strip()
-
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            log("⚠️ Gemini returned unexpected format, skipping batch.")
-            return [None] * len(posts)
-
-        # Pad/trim to match input length
-        while len(parsed) < len(posts):
-            parsed.append(None)
-        return parsed[:len(posts)]
+        return response.text.strip()
 
     except Exception as e:
         log(f"⚠️ Gemini error: {e}")
-        return [None] * len(posts)
-
+        return f"❌ Wystąpił błąd podczas generowania raportu: {e}"
 
 # ---------------------------------------------------------------------------
 # Main analysis pipeline
 # ---------------------------------------------------------------------------
 
-def analyze_posts(
+def process_and_summarize(
     posts: list[dict],
-    custom_keywords: list[str],
-    top_n: int,
+    user_instructions: str,
     gemini_api_key: str,
-    criteria_description: str,
-    log: Callable,
-) -> pd.DataFrame:
-    """
-    Main analysis pipeline.
-
-    Returns a DataFrame with columns:
-      rank, original_question, summary, category, reactions, comments, score
-    """
-    if not posts:
-        log("⚠️ No posts to analyze.")
-        return pd.DataFrame()
-
-def filter_questions(posts: list[dict], custom_keywords: list[str], log: Callable = None) -> list[dict]:
-    """Filter posts to keep only questions or those matching custom keywords."""
-    if log:
-        log(f"🔍 Pre-filtering {len(posts)} posts for questions...")
-
-    filtered = []
-    for p in posts:
-        text = p["text"]
-        is_q = _is_question(text)
-        has_custom = any(kw.lower() in text.lower() for kw in custom_keywords if kw.strip())
-        if is_q or has_custom:
-            filtered.append(p)
-
-    if log:
-        log(f"  → {len(filtered)} posts contain questions or match keywords.")
-    return filtered
-
-
-def deduplicate_posts(posts: list[dict], log: Callable = None) -> list[dict]:
-    """Deduplicate posts using MD5 hash of normalized text."""
-    seen_hashes: set[str] = set()
-    deduped = []
-    for p in posts:
-        import hashlib
-        # Normalize whitespace and lowercase
-        norm = re.sub(r'\s+', ' ', p["text"]).lower()
-        h = hashlib.md5(norm.encode()).hexdigest()
-        if h not in seen_hashes:
-            seen_hashes.add(h)
-            deduped.append(p)
-
-    if log and len(deduped) < len(posts):
-        log(f"  → Removed {len(posts) - len(deduped)} duplicate posts.")
-    return deduped
-
-
-def analyze_posts(
-    posts: list[dict],
-    custom_keywords: list[str],
-    top_n: int,
-    gemini_api_key: str,
-    criteria_description: str,
     model: str,
     log: Callable,
-) -> pd.DataFrame:
+) -> tuple[str, pd.DataFrame]:
     """
-    Main analysis pipeline.
-
-    Returns a DataFrame with columns:
-      rank, original_question, summary, category, reactions, comments, score
+    1. Clean data.
+    2. Deduplicate.
+    3. Send to Gemini for Markdown summary.
     """
     if not posts:
         log("⚠️ No posts to analyze.")
-        return pd.DataFrame()
+        return "", pd.DataFrame()
 
-    # Step 1: Regex pre-filter — keep questions (syntactic) + custom keywords
-    filtered = filter_questions(posts, custom_keywords, log)
+    log(f"🧹 Cleaning and deduplicating {len(posts)} posts...")
+    
+    # Deduplicate
+    seen_hashes = set()
+    deduped = []
+    import hashlib
+    
+    for p in posts:
+        # Clean text first
+        cleaned_text = clean_text(p["text"])
+        if not cleaned_text:
+            continue
+            
+        norm = re.sub(r'\s+', ' ', cleaned_text).lower()
+        h = hashlib.md5(norm.encode()).hexdigest()
+        
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            # Store cleaned text back in the dict for the DF/LLM
+            p["cleaned_text"] = cleaned_text
+            deduped.append(p)
 
-    # Deduplicate by full-text hash (safety net for scraper-level duplicates).
-    filtered = deduplicate_posts(filtered, log)
+    log(f"  → Result files: {len(deduped)} unique posts.")
 
-
-    if not filtered:
-        log("⚠️ No questions found after pre-filtering. Try broader criteria or more posts.")
-        return pd.DataFrame()
-
-    # Step 2: Compute engagement score
-    for p in filtered:
-        p["score"] = p.get("reactions", 0) + p.get("comments", 0) * 3
-
-    # Cap candidate pool — if we have engagement data, prefer high-scoring posts;
-    # otherwise just take the first top_n * 3 (preserve feed order as a proxy for recency)
-    has_engagement = any(p["score"] > 0 for p in filtered)
-    if has_engagement:
-        filtered.sort(key=lambda p: p["score"], reverse=True)
-        candidate_pool = filtered[: top_n * 3]
-    else:
-        # No engagement data — send all filtered posts, let Gemini decide relevance
-        candidate_pool = filtered[: top_n * 3]
-    log(f"  → Sending top {len(candidate_pool)} posts to Gemini for analysis using {model}...")
+    # Convert to DataFrame for export
+    df = pd.DataFrame(deduped)
+    if not df.empty:
+        # Reorder columns if possible
+        cols = ["cleaned_text", "reactions", "comments"]
+        # Add others if exist
+        for c in df.columns:
+            if c not in cols:
+                cols.append(c)
+        df = df[cols]
 
     if not gemini_api_key:
-        log("⚠️ No Gemini API key provided. Returning raw pre-filtered questions without AI analysis.")
-        rows = []
-        for i, p in enumerate(candidate_pool[:top_n], 1):
-            rows.append({
-                "rank": i,
-                "original_question": p["text"][:300],
-                "summary": "(brak klucza API Gemini — brak podsumowania)",
-                "category": "—",
-                "reactions": p.get("reactions", 0),
-                "comments": p.get("comments", 0),
-                "score": p["score"],
-            })
-        return pd.DataFrame(rows)
+        log("⚠️ No Gemini API key provided. Skipping LLM summary.")
+        return "⚠️ Brak klucza API. Nie wygenerowano podsumowania.", df
 
-    # Step 3: Gemini batch analysis (in batches of 20)
-    BATCH_SIZE = 20
-    all_results: list[dict | None] = []
-
-    for batch_start in range(0, len(candidate_pool), BATCH_SIZE):
-        batch = candidate_pool[batch_start: batch_start + BATCH_SIZE]
-        batch_num = batch_start // BATCH_SIZE + 1
-        total_batches = (len(candidate_pool) + BATCH_SIZE - 1) // BATCH_SIZE
-        log(f"  🤖 Gemini batch {batch_num}/{total_batches} ({len(batch)} posts)...")
-
-        results = _call_gemini_batch(batch, criteria_description, gemini_api_key, model, log)
-        all_results.extend(results)
-
-    # Step 4: Merge results with posts, filter nulls, sort by score
-    rows = []
-    for post, result in zip(candidate_pool, all_results):
-        if result is None:
-            continue
-        if not isinstance(result, dict):
-            continue
-        original = result.get("original_question") or post["text"][:300]
-        summary = result.get("summary", "")
-        category = result.get("category", "—")
-        if not summary:
-            continue
-        rows.append({
-            "original_question": original,
-            "summary": summary,
-            "category": category,
-            "reactions": post.get("reactions", 0),
-            "comments": post.get("comments", 0),
-            "score": post["score"],
-        })
-
-    if not rows:
-        log("⚠️ Gemini found no posts matching the criteria.")
-        return pd.DataFrame()
-
-    # Sort by score descending, take top N
-    rows.sort(key=lambda r: r["score"], reverse=True)
-    rows = rows[:top_n]
-
-    for i, row in enumerate(rows, 1):
-        row["rank"] = i
-
-    df = pd.DataFrame(
-        rows,
-        columns=["rank", "original_question", "summary", "category", "reactions", "comments", "score"],
-    )
-    log(f"✅ Analysis complete. {len(df)} results ready.")
-    return df
+    log("🤖 Generating summary with Gemini...")
+    summary = _call_gemini_summary(deduped, user_instructions, gemini_api_key, model, log)
+    
+    log("✅ Report generated.")
+    return summary, df

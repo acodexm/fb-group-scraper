@@ -61,18 +61,35 @@ async def _do_login(page: Page, email: str, password: str, log: Callable) -> boo
     await page.wait_for_timeout(2000)
 
     # Accept cookie consent
-    for selector in [
+    # Try various selectors for different regions/versions
+    cookie_selectors = [
         '[data-testid="cookie-policy-manage-dialog-accept-button"]',
+        'button[data-cookiebanner="accept_button"]',
         'button:has-text("Allow all cookies")',
         'button:has-text("Zezwól na wszystkie pliki cookie")',
         'button:has-text("Accept All")',
         'button:has-text("Akceptuj wszystko")',
-    ]:
+        '[aria-label="Allow all cookies"]',
+        '[aria-label="Zezwól na wszystkie pliki cookie"]',
+        '[title="Allow all cookies"]',
+        '[title="Zezwól na wszystkie pliki cookie"]',
+        # Fallback for generic "Allow" in a dialog
+        'div[role="dialog"] button:has-text("Zezwól")',
+        'div[role="dialog"] button:has-text("Allow")',
+    ]
+    
+    for selector in cookie_selectors:
         try:
             btn = page.locator(selector)
-            if await btn.count() > 0:
-                await btn.first.click()
-                await page.wait_for_timeout(1000)
+            count = await btn.count()
+            if count > 0:
+                # Iterate in case there are multiple (e.g. hidden ones), try likely visible one
+                for i in range(count):
+                    if await btn.nth(i).is_visible():
+                        await btn.nth(i).click()
+                        log("🍪 Cookie consent accepted.")
+                        await page.wait_for_timeout(1000)
+                        break
                 break
         except Exception:
             pass
@@ -82,25 +99,66 @@ async def _do_login(page: Page, email: str, password: str, log: Callable) -> boo
     await page.wait_for_timeout(600)
     await page.fill('input[name="pass"]', password)
     await page.wait_for_timeout(600)
-    await page.click('button[name="login"]')
+    
+    # Click login - try multiple selectors including Polish
+    login_btn_selectors = [
+        'button[name="login"]',
+        'button:has-text("Log In")',
+        'button:has-text("Zaloguj się")',
+        'div[role="button"]:has-text("Zaloguj się")',
+        '#loginbutton',
+        '[data-testid="royal_login_button"]'
+    ]
+    
+    clicked = False
+    for sel in login_btn_selectors:
+        try:
+            if await page.locator(sel).count() > 0:
+                if await page.locator(sel).first.is_visible():
+                    await page.click(sel)
+                    clicked = True
+                    break
+        except Exception:
+            pass
+            
+    if not clicked:
+        log("⚠️ Could not find explicit login button, trying Enter key...")
+        await page.keyboard.press("Enter")
 
-    log("⏳ Waiting for login to complete...")
-    await page.wait_for_timeout(4000)
+    log("⏳ Waiting for login/2FA redirect...")
+    
+    # Wait for navigation or URL change
+    # Check repeatedly for 2FA indicators or success
+    two_factor_detected = False
+    
+    for _ in range(15): # Check for 15 seconds
+        await page.wait_for_timeout(1000)
+        url = page.url.lower()
+        if any(x in url for x in ["checkpoint", "challenge", "two_step", "login/device", "login/identify", "approval"]):
+            two_factor_detected = True
+            break
+        # If we are effectively home (no login/recover/challenge in URL)
+        if "facebook.com" in url and not any(x in url for x in ["login", "recover", "checkpoint", "challenge"]):
+             # Double check existence of search or feed to be sure?
+             # For now, URL check is usually enough.
+             break
 
-    url = page.url
-    if "checkpoint" in url or "two_step" in url or "login/device" in url or "login/identify" in url:
-        log("🔑 2FA detected! Please complete it manually in the browser window. Waiting up to 90 seconds...")
+    if two_factor_detected:
+        log("🔑 2FA/Checkpoint detected! Please approve in app or enter code. Waiting up to 90s...")
         for _ in range(90):
             await page.wait_for_timeout(1000)
-            current = page.url
-            if not any(x in current for x in ["checkpoint", "two_step", "login/device", "login/identify", "login"]):
+            url = page.url.lower()
+            if not any(x in url for x in ["checkpoint", "challenge", "two_step", "login/device", "login/identify", "approval"]):
+                log("✅ 2FA passed!")
                 break
         else:
             log("❌ 2FA timeout — could not complete login.")
             return False
 
-    if "login" in page.url or "recover" in page.url:
-        log("❌ Login failed. Please check your credentials.")
+    # Final check
+    url = page.url.lower()
+    if "login" in url or "recover" in url or "checkpoint" in url:
+        log(f"❌ Login failed or stuck (URL: {url}). Please check credentials/2FA.")
         return False
 
     log("✅ Logged in successfully!")
@@ -373,39 +431,37 @@ async def _scrape_async(
 
         # Attempt to extract group name
         try:
-             # Strategy 1: OG title
+             # Strategy 1: Open Graph Title (most reliable)
              og_title = await page.locator('meta[property="og:title"]').get_attribute("content")
              if og_title:
                  group_name = og_title.strip()
              
-             if not group_name or "facebook" in group_name.lower():
-                 # Strategy 2: h1
-                 h1_text = await page.locator("h1").first.text_content()
-                 if h1_text:
-                     group_name = h1_text.strip()
+             # Strategy 2: Determine if it's "Facebook" or just generic, then try H1
+             if not group_name or group_name.lower() == "facebook":
+                 h1 = page.locator("h1").first
+                 if await h1.count() > 0:
+                     group_name = (await h1.text_content()).strip()
 
-             if not group_name or "facebook" in group_name.lower():
-                 # Strategy 3: Look for a link to the group itself in the banner
-                 # Many groups have the name in an anchor tag pointing to the group URL
-                 # We look for an anchor whose href ends with the group ID/slug
-                 # or contains the group ID/slug
+             # Strategy 3: JSON-LD metadata
+             if not group_name or group_name.lower() == "facebook":
                  try:
-                     group_id_slug = group_url.rstrip("/").split("/")[-1]
-                     # Find anchor with href containing this slug, but exclude post permalinks
-                     # Usually the group name is in a large font or specific location
-                     potential_name = await page.locator(f'a[href*="{group_id_slug}"][role="link"]').first.text_content()
-                     if potential_name:
-                         group_name = potential_name.strip()
-                 except Exception:
+                    ld_json = await page.locator('script[type="application/ld+json"]').all_inner_texts()
+                    for script in ld_json:
+                        data = json.loads(script)
+                        if "name" in data and ("Group" in data.get("@type", "") or "Place" in data.get("@type", "")):
+                            group_name = data["name"]
+                            break
+                 except:
                      pass
-
         except Exception:
             pass
         
         if group_name:
-             # Clean up " | Facebook" if present
-             group_name = group_name.replace(" | Facebook", "").replace("Facebook", "").strip()
-        log(f"ℹ️ Group name: {group_name if group_name else 'Unknown'}")
+             group_name = re.sub(r'\s*\|\s*Facebook$', '', group_name)
+             group_name = re.sub(r'^Facebook\s*-\s*', '', group_name)
+             group_name = group_name.strip()
+             
+        log(f"ℹ️ Group name: {group_name if group_name else 'Unknown'} (ID/Slug: {group_url.rstrip('/').split('/')[-1]})")
 
 
         # Dismiss popups
@@ -423,45 +479,77 @@ async def _scrape_async(
             except Exception:
                 pass
 
-        log(f"📜 Scrolling to collect up to {max_posts} posts...")
+        log(f"📜 Scrolling to collect {max_posts} unique posts...")
 
-        seen_keys: set[str] = set()
-        # Store (text, element_handle) for enrichment phase
-        collected: list[tuple[str, object]] = []
+        import hashlib
+        import re as _re
+
+        seen_hashes: set[str] = set()
+        posts: list[dict] = []
+        
         last_height = 0
         no_new_count = 0
         scroll_round = 0
 
-        # ── Phase 1: Fast scroll — collect text only ──────────────────────
-        while len(collected) < max_posts:
+        # We need a clean_text helper here for strict deduplication
+        def _clean_for_hash(t: str) -> str:
+            # Remove HTML tags (simple regex)
+            t = _re.sub(r'<[^>]+>', '', t)
+            # Remove whitespace etc
+            t = _re.sub(r'\s+', ' ', t).lower()
+            return t.strip()
+
+        # ── Fast scroll & collect ─────────────────────────────────────────────
+        while len(posts) < max_posts:
             if stop_event and stop_event.is_set():
                 log("🛑 Scraping stopped by user.")
                 break
             scroll_round += 1
 
+            # Get all story messages
             story_messages = await page.locator('[data-ad-rendering-role="story_message"]').all()
 
             new_this_round = 0
             for story_el in story_messages:
-                if len(collected) >= max_posts:
+                if len(posts) >= max_posts:
                     break
+                
                 try:
+                    # Expand "See more" quickly if present (optional - might be slow?)
+                    # If we don't, we get truncated text. For reliable LLM analysis, full text is better.
+                    # But user wanted speed/no enrichment phase. 
+                    # Let's try to grab text first; if it ends in "..." do we click?
+                    # For now, let's JUST grab text to be fast.
+                    
                     text = (await story_el.inner_text()).strip()
-                    if not text or len(text) < 15:
+                    if not text: 
                         continue
-                    # Normalize key: collapse whitespace + lowercase to catch
-                    # truncated variants of the same post across scroll rounds
-                    import re as _re
-                    key = _re.sub(r'\s+', ' ', text).lower()[:200]
-                    if key in seen_keys:
+                    
+                    # Strict deduplication
+                    norm = _clean_for_hash(text)
+                    if not norm: 
                         continue
-                    seen_keys.add(key)
-                    collected.append((text, story_el))
+
+                    h = hashlib.md5(norm.encode("utf-8")).hexdigest()
+                    if h in seen_hashes:
+                        continue
+                        
+                    seen_hashes.add(h)
+                    
+                    # Store
+                    # We create the post dict immediately.
+                    # Note: We are NOT fetching comments/reactions to save time.
+                    # User instructions: "remove enrichment part"
+                    posts.append({
+                        "text": text,
+                        "reactions": 0,
+                        "comments": 0
+                    })
                     new_this_round += 1
                 except Exception:
                     continue
 
-            log(f"  → Round {scroll_round}: {new_this_round} new posts | Total: {len(collected)}/{max_posts}")
+            log(f"  → Round {scroll_round}: {new_this_round} new unique posts | Total: {len(posts)}/{max_posts}")
 
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(scroll_wait_ms)
@@ -470,79 +558,20 @@ async def _scrape_async(
             if new_height <= last_height:
                 no_new_count += 1
                 log(f"  ⚠️ No new content (attempt {no_new_count}/3)")
-                if no_new_count >= 3:
-                    log("  ℹ️ Reached end of feed.")
+                if no_new_count >= 5: # increased from 3
+                    log("  ℹ️ Reached end of feed or scroll stuck.")
                     break
             else:
                 no_new_count = 0
             last_height = new_height
 
-            if scroll_round >= 60:
+            if scroll_round >= 100: # allow more rounds
                 log("  ℹ️ Reached maximum scroll limit.")
                 break
 
-        log(f"✅ Collected {len(collected)} posts. Enriching with reactions & comments...")
-
-        # ── Phase 2: Enrich — expand text + extract engagement ───────────
-        # Timeouts (from UI settings)
-        PER_POST_TIMEOUT = per_post_timeout
-        TOTAL_TIMEOUT    = enrich_total_timeout
-        enrich_start = asyncio.get_event_loop().time()
-
-        async def _enrich_one(text: str, story_el) -> dict:
-            """Enrich a single post — expand text and extract engagement.
-            
-            We pass story_el's ElementHandle to the extraction functions.
-            The JS inside each function walks up to the article container,
-            so we never need to resolve the article locator separately.
-            """
-            await _expand_see_more(story_el)
-            full_text = (await story_el.inner_text()).strip() or text
-            reactions = await _extract_reactions(story_el)
-            comments  = await _extract_comment_count(story_el)
-            return {"text": full_text, "reactions": reactions, "comments": comments}
-
-        timed_out_total = False
-        for i, (text, story_el) in enumerate(collected):
-            if stop_event and stop_event.is_set():
-                log("🛑 Scraping stopped by user during enrichment.")
-                break
-
-            # Check overall budget
-            elapsed = asyncio.get_event_loop().time() - enrich_start
-            if elapsed >= TOTAL_TIMEOUT:
-                log(f"  ⏱️ Enrichment time limit reached ({TOTAL_TIMEOUT:.0f}s). "
-                    f"Remaining {len(collected) - i} posts added without engagement data.")
-                # Add remaining posts without enrichment
-                for text2, _ in collected[i:]:
-                    posts.append({"text": text2, "reactions": 0, "comments": 0})
-                timed_out_total = True
-                break
-
-            try:
-                result = await asyncio.wait_for(
-                    _enrich_one(text, story_el),
-                    timeout=PER_POST_TIMEOUT,
-                )
-                posts.append(result)
-                # Debug: log first post's engagement to verify extraction works
-                if i == 0:
-                    log(f"  🔬 Post #1 engagement: reactions={result['reactions']}, comments={result['comments']}")
-            except asyncio.TimeoutError:
-                posts.append({"text": text, "reactions": 0, "comments": 0})
-            except Exception as e:
-                posts.append({"text": text, "reactions": 0, "comments": 0})
-
-
-            # Progress log every 10 posts
-            done = i + 1
-            if done % 10 == 0 or done == len(collected):
-                elapsed = asyncio.get_event_loop().time() - enrich_start
-                log(f"  🔎 Enriched {done}/{len(collected)} posts... ({elapsed:.0f}s elapsed)")
-
         await browser.close()
 
-    log(f"✅ Scraping complete. Total posts collected: {len(posts)}")
+    log(f"✅ Scraping complete. Total unique posts collected: {len(posts)}")
     return posts, group_name
 
 

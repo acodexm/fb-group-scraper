@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import gradio as gr
 import pandas as pd
 
-from analyzer import analyze_posts
+from analyzer import process_and_summarize
 from scraper import scrape_group_threaded
 from app.persistence import (
     save_to_history,
@@ -16,6 +16,7 @@ from app.persistence import (
     load_history,
     load_presets,
     get_session_file_path,
+    save_run,
 )
 
 _executor = ThreadPoolExecutor(max_workers=1)
@@ -54,8 +55,18 @@ def run_pipeline(
     """
     STOP_EVENT.clear()
 
+    # --- Sanitization ---
+    group_url = (group_url or "").strip()
+    email = (email or "").strip()
+    password = (password or "").strip()
+    gemini_api_key = (gemini_api_key or "").strip()
+    criteria_description = (criteria_description or "").strip()
+    custom_keywords_raw = (custom_keywords_raw or "").strip()
+    # top_n and max_posts are ints, likely not None ifSlider used, but good to check?
+    # Sliders usually pass int.
+
     # --- Validate ---
-    if not group_url.strip():
+    if not group_url:
         yield "❌ Proszę podać URL grupy Facebook.", None, gr.update(visible=False)
         return
 
@@ -78,14 +89,14 @@ def run_pipeline(
         save_preset("criteria", criteria_description.strip())
     if custom_keywords_raw.strip():
         save_preset("keywords", custom_keywords_raw.strip())
-
-    custom_keywords = parse_custom_keywords(custom_keywords_raw)
+    
     if not gemini_api_key.strip():
         gemini_api_key = os.getenv("GEMINI_API_KEY", "")
 
     log_lines: list[str] = []
     log_q: queue.Queue[str | None] = queue.Queue()
-    result_holder: list[list[dict]] = [[]]  # mutable container for thread result
+    # Container for scraper result: [posts, group_name]
+    result_holder: list[object] = [[], ""] 
 
     def _run_scraper():
         if STOP_EVENT.is_set():
@@ -106,12 +117,14 @@ def run_pipeline(
             stop_event=STOP_EVENT,
         )
         result_holder[0] = posts
+        result_holder[1] = group_name
+        
         if group_name:
             save_to_history(group_url.strip(), group_name)
 
     # --- Launch scraper in background thread ---
     log_lines.append("🚀 Rozpoczynam scrapowanie...")
-    yield "\n".join(log_lines), None, gr.update(visible=False)
+    yield "\n".join(log_lines), "", gr.update(visible=False)
 
     future = _executor.submit(_run_scraper)
 
@@ -121,7 +134,7 @@ def run_pipeline(
             msg = log_q.get(timeout=0.3)
         except queue.Empty:
             # Yield current log state to keep UI alive
-            yield "\n".join(log_lines), None, gr.update(visible=False)
+            yield "\n".join(log_lines), "", gr.update(visible=False)
             if future.done():
                 # Drain any remaining messages
                 while not log_q.empty():
@@ -136,69 +149,76 @@ def run_pipeline(
             # Sentinel: scraping finished
             break
         log_lines.append(msg)
-        yield "\n".join(log_lines), None, gr.update(visible=False)
+        yield "\n".join(log_lines), "", gr.update(visible=False)
 
     # Check for exceptions in the scraper thread
     try:
         future.result()
     except Exception as e:
         log_lines.append(f"❌ Błąd podczas scrapowania: {e}")
-        yield "\n".join(log_lines), None, gr.update(visible=False)
+        yield "\n".join(log_lines), "", gr.update(visible=False)
         return
 
     posts = result_holder[0]
+    group_name = result_holder[1]
 
     if not posts:
         log_lines.append("⚠️ Nie znaleziono żadnych postów. Sprawdź URL grupy i dane logowania.")
-        yield "\n".join(log_lines), None, gr.update(visible=False)
+        yield "\n".join(log_lines), "", gr.update(visible=False)
         return
 
-    # --- Analysis ---
-    log_lines.append(f"\n📊 Analizuję {len(posts)} postów...")
-    yield "\n".join(log_lines), None, gr.update(visible=False)
+    # --- Analysis / Summarization ---
+    log_lines.append(f"\n📊 Przetwarzam {len(posts)} postów...")
+    yield "\n".join(log_lines), "", gr.update(visible=False)
 
     analysis_log: list[str] = []
 
     def analysis_log_fn(msg: str):
         analysis_log.append(msg)
 
+    # Call the new processing function
+    
     try:
-        df = analyze_posts(
+        summary_md, df = process_and_summarize(
             posts=posts,
-            custom_keywords=custom_keywords,
-            top_n=int(top_n),
+            user_instructions=criteria_description or DEFAULT_CRITERIA,
             gemini_api_key=gemini_api_key,
-            criteria_description=criteria_description or DEFAULT_CRITERIA,
             model=model,
             log=analysis_log_fn,
         )
     except Exception as e:
         log_lines.append(f"❌ Błąd podczas analizy: {e}")
-        yield "\n".join(log_lines), None, gr.update(visible=False)
+        yield "\n".join(log_lines), "", gr.update(visible=False)
         return
 
     log_lines.extend(analysis_log)
-    yield "\n".join(log_lines), None, gr.update(visible=False)
+    yield "\n".join(log_lines), "", gr.update(visible=False)
 
-    if df is None or df.empty:
-        log_lines.append("⚠️ Brak wyników spełniających kryteria.")
-        yield "\n".join(log_lines), None, gr.update(visible=False)
+    if not summary_md and df.empty:
+        log_lines.append("⚠️ Brak wyników.")
+        yield "\n".join(log_lines), "", gr.update(visible=False)
         return
+    
+    # --- Save Run History ---
+    if summary_md:
+        import datetime
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Ensure group name is set (fallback to URL slug if empty from scraper)
+        final_group_name = group_name if group_name else group_url.split("/")[-1]
+        save_run(final_group_name, group_url, summary_md, now_str)
+        log_lines.append("💾 Wynik zapisany w historii.")
 
     # --- Export ---
-    tmp = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".csv", prefix="fb_scraper_results_"
-    )
-    df.to_csv(tmp.name, index=False, encoding="utf-8-sig")
+    tmp_path = ""
+    if not df.empty:
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".csv", prefix="fb_scraper_results_"
+        )
+        df.to_csv(tmp.name, index=False, encoding="utf-8-sig")
+        tmp_path = tmp.name
 
-    display_df = df[["rank", "original_question", "summary", "category", "reactions", "comments"]].copy()
-    display_df.columns = ["#", "Oryginalne pytanie", "Podsumowanie (PL)", "Kategoria", "Reakcje", "Komentarze"]
-    # Sanitize newlines in text columns — multi-line cells break Gradio's table rendering
-    for col in ["Oryginalne pytanie", "Podsumowanie (PL)", "Kategoria"]:
-        display_df[col] = display_df[col].astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
-
-    log_lines.append(f"\n🎉 Gotowe! Znaleziono {len(df)} pytań/problemów.")
-    yield "\n".join(log_lines), display_df, gr.update(value=tmp.name, visible=True)
+    log_lines.append(f"\n🎉 Gotowe! Raport wygenerowany.")
+    yield "\n".join(log_lines), summary_md, gr.update(value=tmp_path, visible=True)
 
 
 def clear_session(email: str) -> str:

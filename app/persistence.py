@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -17,8 +18,6 @@ DEFAULT_CRITERIA = (
 # ---------------------------------------------------------------------------
 
 SETTINGS_FILE = Path("settings.json")
-SETTINGS_FILE = Path("settings.json")
-# COOKIES_FILE = Path(".fb_session.json")  # Deprecated in favor of per-user session files
 SESSION_META_FILE = Path(".fb_session_meta.json")
 
 def get_session_file_path(email: str) -> Path:
@@ -55,8 +54,6 @@ def load_settings() -> dict:
     defaults = dict(_DEFAULT_SETTINGS)
     # Env var fallbacks for sensitive data
     defaults["email"] = os.getenv("FB_EMAIL", "")
-    # Password isn't saved in settings file usually, but we check env
-    # Note: "password" key is not in _DEFAULT_SETTINGS strictly, but used in UI.
     
     if not SETTINGS_FILE.exists():
         return defaults
@@ -64,7 +61,6 @@ def load_settings() -> dict:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         merged = defaults
         merged.update({k: v for k, v in saved.items() if k in _DEFAULT_SETTINGS})
-        # If email is empty in saved settings, try env again (might have been overwritten by empty string)
         if not merged["email"]:
              merged["email"] = os.getenv("FB_EMAIL", "")
         return merged
@@ -136,7 +132,6 @@ def load_history() -> list[dict]:
 def save_to_history(url: str, name: str | None = None) -> None:
     """Prepend group to history. If name is not provided, derive from URL."""
     url = url.strip().rstrip("/")
-    # Derive a human-readable name from the URL slug if not provided
     if not name:
         slug = url.split("/groups/")[-1].split("/")[0] if "/groups/" in url else url.split("/")[-1]
         name = slug.replace("-", " ").replace("_", " ").title() or url
@@ -150,7 +145,6 @@ def save_to_history(url: str, name: str | None = None) -> None:
     GROUPS_HISTORY_FILE.write_text(
         json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-
 
 def history_choices() -> list[str]:
     """Return display strings for the dropdown."""
@@ -172,7 +166,7 @@ PRESETS_FILE = Path("presets.json")
 
 
 def load_presets(key: str) -> list[str]:
-    """Return saved preset strings for a given key (e.g. 'criteria', 'keywords')."""
+    """Return saved preset strings for a given key."""
     if not PRESETS_FILE.exists():
         return []
     try:
@@ -198,3 +192,33 @@ def save_preset(key: str, value: str) -> None:
     existing.insert(0, value)
     data[key] = existing[:15]
     PRESETS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Runs History (runs_history.json)
+# ---------------------------------------------------------------------------
+
+RUNS_HISTORY_FILE = Path("runs_history.json")
+
+def load_runs() -> list[dict]:
+    """Return list of saved runs (timestamp, group_name, summary, etc)."""
+    if not RUNS_HISTORY_FILE.exists():
+        return []
+    try:
+        return json.loads(RUNS_HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+def save_run(group_name: str, group_url: str, summary: str, run_date: str) -> None:
+    """Save a run result."""
+    runs = load_runs()
+    entry = {
+        "date": run_date,
+        "group_name": group_name,
+        "group_url": group_url,
+        "summary": summary,
+    }
+    runs.insert(0, entry)
+    # Keep last 50 runs
+    runs = runs[:50]
+    RUNS_HISTORY_FILE.write_text(json.dumps(runs, ensure_ascii=False, indent=2), encoding="utf-8")
