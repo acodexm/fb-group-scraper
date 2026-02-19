@@ -4,48 +4,72 @@ Narzędzie do scrapowania grup na Facebooku w poszukiwaniu najczęstszych pytań
 
 ---
 
-## 🚀 Instalacja (jednorazowa)
+## 🍎 Instrukcja krok po kroku (macOS)
 
-### 1. Wymagania
+Jeśli zaczynasz od zera, wykonaj poniższe kroki w aplikacji **Terminal**.
 
-- **Python 3.10+** — pobierz z [python.org](https://www.python.org/downloads/)
-- Dostęp do terminala (macOS: aplikacja „Terminal")
+### 1. Przygotuj środowisko
 
-### 2. Zainstaluj zależności
+1. Zainstaluj **Python 3.10+** (jeśli nie masz):
+   - Pobierz z [python.org/downloads/macos](https://www.python.org/downloads/macos/) i zainstaluj.
+   - W trakcie instalacji zaznacz opcję "Install certificates" (częste na macOS).
+2. Otwórz Terminal i sprawdź wersję:
+   ```bash
+   python3 --version
+   ```
 
-Otwórz terminal, przejdź do folderu projektu i wykonaj:
+### 2. Pobierz i zainstaluj projekt
+
+Wpisz (lub skopiuj) poniższe komendy w Terminalu:
 
 ```bash
-cd /Users/acodexm/code/facebook-scraper
+# 1. Przejdź do folderu, gdzie chcesz trzymać projekt (np. Dokumenty)
+cd ~/Documents
+
+# 2. Pobierz projekt (jeśli masz ZIP, pomiń ten krok i wejdź do rozpakowanego folderu)
+git clone https://your-repo-url/facebook-scraper.git
+cd facebook-scraper
+
+# 3. Utwórz "wirtualne środowisko" (izolowany system dla tego projektu)
+python3 -m venv venv
+
+# 4. Aktywuj to środowisko (tę komendę trzeba wpisać ZAWSZE przed pracą)
+source venv/bin/activate
+
+# 5. Zainstaluj wymagane biblioteki
+pip install --upgrade pip
 pip install -r requirements.txt
+
+# 6. Zainstaluj silnik przeglądarki
 playwright install chromium
 ```
 
-> Instalacja zajmuje kilka minut (pobieranie przeglądarki Chromium ~150 MB).
+### 3. Konfiguracja Klucza AI (Opcjonalne)
 
-### 3. (Opcjonalnie) Klucz API Gemini
+Aby raporty były inteligentnie podsumowywane przez Gemini:
 
-Jeśli chcesz korzystać z inteligentnego grupowania pytań przez AI:
-
-1. Wejdź na [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) i wygeneruj bezpłatny klucz
-2. Skopiuj plik `.env.example` jako `.env`:
+1. Zdobądź darmowy klucz na [aistudio.google.com](https://aistudio.google.com/app/apikey).
+2. Utwórz plik konfiguracyjny:
    ```bash
    cp .env.example .env
+   open -e .env
    ```
-3. Otwórz plik `.env` w edytorze i wklej swój klucz:
-   ```
-   GEMINI_API_KEY=AIza...twój_klucz...
-   ```
+3. W otwartym pliku wklej swój klucz po znaku równości (`GEMINI_API_KEY=...`) i zapisz (Cmd+S).
 
 ---
 
-## ▶️ Uruchomienie
+## ▶️ Jak uruchamiać (na co dzień)
 
-```bash
-python app.py
-```
+Za każdym razem, gdy chcesz użyć programu:
 
-Przeglądarka otworzy się automatycznie pod adresem **http://localhost:7860**
+1. Otwórz Terminal.
+2. Wpisz komendy:
+   ```bash
+   cd ~/Documents/facebook-scraper  # (lub twoja ścieżka do folderu)
+   source venv/bin/activate
+   python app.py
+   ```
+3. Otwórz w przeglądarce link, który się pojawi: **http://localhost:7860**
 
 ---
 
